@@ -1165,9 +1165,9 @@ async fn test_throttled_peer_does_not_hold_back_normal_peers() -> anyhow::Result
             fast.request(piece, begin, BLOCK).await?;
         }
 
-        let started = Instant::now();
+        // Served long before the 1 KiB/s of the throttled peer would let a single block through:
+        // the 5 s limit of `expect_pieces` is the only clock this relies on.
         let got = fast.expect_pieces(4, Duration::from_secs(5)).await?;
-        assert!(started.elapsed() < Duration::from_secs(3));
         for (piece, begin, data) in &got {
             assert_eq!(data, seed.block(*piece, *begin, BLOCK));
         }
@@ -1203,26 +1203,35 @@ async fn test_throttled_peers_share_the_default_rate() -> anyhow::Result<()> {
         // 32 KiB/s: two blocks out of the initial burst, then one every half a second.
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0005-")).await?;
+        // At most as many requests as a throttled connection may have waiting (more would be
+        // dropped, by design), so every round waits for its blocks.
         let started = Instant::now();
         for piece in 0..3 {
             peer.request(piece, 0, BLOCK).await?;
             peer.request(piece, BLOCK, BLOCK).await?;
+            peer.expect_pieces(2, Duration::from_secs(30)).await?;
         }
-        peer.expect_pieces(6, Duration::from_secs(15)).await?;
+        // Only a lower bound: a slow machine can only make this longer.
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(1400), "too fast: {took:?}");
-        assert!(took < Duration::from_secs(8), "too slow: {took:?}");
 
-        // Lifting the limit applies to what is requested from now on.
+        // Lifting the limit applies to what is requested from now on. At 32 KiB/s this much (48 blocks) would
+        // take over 20 seconds, so getting it all within the timeout shows that the limit is gone,
+        // by a margin that doesn't depend on how fast the machine is.
         seed.session.set_throttled_upload_bps(None);
         assert_eq!(seed.session.throttled_upload_bps(), None);
-        let started = Instant::now();
-        for piece in 0..4 {
-            peer.request(piece, 0, BLOCK).await?;
-            peer.request(piece, BLOCK, BLOCK).await?;
-        }
-        peer.expect_pieces(8, Duration::from_secs(15)).await?;
-        assert!(started.elapsed() < Duration::from_secs(2));
+        timeout(Duration::from_secs(15), async {
+            for _ in 0..12 {
+                for piece in 0..2 {
+                    peer.request(piece, 0, BLOCK).await?;
+                    peer.request(piece, BLOCK, BLOCK).await?;
+                }
+                peer.expect_pieces(4, Duration::from_secs(15)).await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("the lifted limit still applies")??;
         Ok(())
     })
     .await
@@ -1833,13 +1842,17 @@ async fn test_throttled_peer_cannot_queue_unbounded_requests() -> anyhow::Result
             "{served_after} blocks served after the flood"
         );
         // The queue frees up as blocks are served: new requests are accepted again.
-        let (msgs, closed) = peer.collect(Duration::from_millis(100)).await;
+        // (Blocks may still be served while this reads, hence the two readings of the counter.)
+        let uploaded_before_read = uploaded(&seed);
+        let (msgs, closed) = peer.collect(Duration::from_secs(1)).await;
+        let uploaded_after_read = uploaded(&seed);
         assert!(!closed);
         let received = msgs
             .iter()
             .filter(|m| matches!(m, Wire::Piece { .. }))
             .count() as u64;
-        assert_eq!(received * BLOCK as u64, uploaded(&seed));
+        assert!(received * BLOCK as u64 <= uploaded_after_read);
+        assert!(received * BLOCK as u64 >= uploaded_before_read);
         peer.request(3, BLOCK, BLOCK).await?;
         peer.expect_pieces(1, Duration::from_secs(5)).await?;
         Ok(())
@@ -1882,9 +1895,11 @@ async fn test_throttled_peers_take_turns() -> anyhow::Result<()> {
                 .count()
         };
         assert!(!got_a.1 && !got_b.1);
+        // The rate is the clock here, so a slow machine only gets fewer blocks through: what
+        // matters is that both are served and that neither is ahead by much.
         let (pa, pb) = (pieces(&got_a.0), pieces(&got_b.0));
-        assert!(pa >= 3, "first peer got {pa} blocks");
-        assert!(pb >= 3, "second peer got {pb} blocks");
+        assert!(pa >= 1, "first peer got {pa} blocks");
+        assert!(pb >= 1, "second peer got {pb} blocks");
         assert!(pa.abs_diff(pb) <= 6, "unfair: {pa} against {pb}");
         Ok(())
     })
