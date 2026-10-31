@@ -1446,6 +1446,81 @@ async fn test_refused_peers_are_not_reconnected_when_more_files_are_selected() -
     .await
 }
 
+// The seeding state reported to the policy follows the selection: it is false while a selected
+// file is missing and true once the files selected later are complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_seeding_state_follows_a_changed_selection() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts {
+            files: Some(2),
+            ..Default::default()
+        })
+        .await?;
+        let policy = TestPolicy::new();
+        let client = start_client(
+            &seed,
+            ClientOpts {
+                policy: Some(policy.clone()),
+                initial_peers: vec![seed.addr()],
+                only_files: Some(vec![0]),
+                ..Default::default()
+            },
+        )
+        .await?;
+        timeout(
+            Duration::from_secs(20),
+            client.handle.wait_until_completed(),
+        )
+        .await??;
+        wait_for(
+            "the first connection ended",
+            || policy.count(|e| matches!(e, Ev::Disconnected(_))) == 1,
+            Duration::from_secs(10),
+        )
+        .await?;
+        assert!(policy.seen.lock().last().unwrap().ctx.we_are_seeding);
+
+        // A file is missing again: not seeding any more.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let both = HashSet::from([0, 1]);
+        client
+            .session
+            .update_only_files(&client.handle, &both)
+            .await?;
+        wait_for(
+            "the second connection",
+            || policy.handshakes() == 2,
+            Duration::from_secs(10),
+        )
+        .await?;
+        {
+            let seen = policy.seen.lock();
+            let handshakes: Vec<_> = seen
+                .iter()
+                .filter(|s| matches!(s.ev, Ev::Handshake { .. }))
+                .collect();
+            assert_eq!(handshakes.len(), 2);
+            assert!(!handshakes[1].ctx.we_are_seeding);
+        }
+
+        // The remaining pieces arrive: seeding again.
+        timeout(
+            Duration::from_secs(20),
+            client.handle.wait_until_completed(),
+        )
+        .await??;
+        wait_for(
+            "the second connection ended",
+            || policy.count(|e| matches!(e, Ev::Disconnected(_))) == 2,
+            Duration::from_secs(10),
+        )
+        .await?;
+        assert!(policy.seen.lock().last().unwrap().ctx.we_are_seeding);
+        Ok(())
+    })
+    .await
+}
+
 // A peer that was disconnected for being refused isn't dialed again after its backoff.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_refused_peer_is_not_redialed_after_a_disconnect() -> anyhow::Result<()> {
