@@ -1836,6 +1836,22 @@ impl Session {
         self.throttled_upload.set(bps);
     }
 
+    /// For dialing peers outside of a live torrent: asks the peer policy, and counts refusals.
+    fn outgoing_admit(&self) -> Option<crate::dht_utils::AdmitFn> {
+        let policy = self.peer_policy.clone()?;
+        let stats = self.stats.clone();
+        Some(Arc::new(move |addr: SocketAddr| {
+            let admitted = policy.admit(canonical_ip(addr.ip()));
+            if !admitted {
+                stats
+                    .counters
+                    .blocked_outgoing
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            admitted
+        }))
+    }
+
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -1851,6 +1867,7 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             self.client_name_and_version.clone(),
+            self.outgoing_admit(),
         )
         .await
         {

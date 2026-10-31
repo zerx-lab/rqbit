@@ -143,6 +143,7 @@ type Rule = Box<dyn Fn(&Ev) -> PeerVerdict + Send + Sync>;
 struct TestPolicy {
     admit: AtomicBool,
     admit_calls: Mutex<Vec<IpAddr>>,
+    readmit_calls: Mutex<Vec<IpAddr>>,
     seen: Mutex<Vec<Seen>>,
     rule: Mutex<Option<Rule>>,
 }
@@ -152,6 +153,7 @@ impl TestPolicy {
         Arc::new(Self {
             admit: AtomicBool::new(true),
             admit_calls: Default::default(),
+            readmit_calls: Default::default(),
             seen: Default::default(),
             rule: Default::default(),
         })
@@ -169,6 +171,10 @@ impl TestPolicy {
 
     fn admit_calls(&self) -> Vec<IpAddr> {
         self.admit_calls.lock().clone()
+    }
+
+    fn readmit_calls(&self) -> Vec<IpAddr> {
+        self.readmit_calls.lock().clone()
     }
 
     fn events(&self) -> Vec<Ev> {
@@ -196,6 +202,11 @@ impl TestPolicy {
 impl PeerPolicy for TestPolicy {
     fn admit(&self, ip: IpAddr) -> bool {
         self.admit_calls.lock().push(ip);
+        self.admit.load(Ordering::SeqCst)
+    }
+
+    fn readmit(&self, ip: IpAddr) -> bool {
+        self.readmit_calls.lock().push(ip);
         self.admit.load(Ordering::SeqCst)
     }
 
@@ -403,7 +414,7 @@ impl FakePeer {
                 return Recv::Msg(m);
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            let mut tmp = [0u8; 64 * 1024];
+            let mut tmp = vec![0u8; 16 * 1024];
             match timeout(left, self.stream.read(&mut tmp)).await {
                 Err(_) => return Recv::Timeout,
                 Ok(Ok(0)) | Ok(Err(_)) => return Recv::Closed,
@@ -1060,6 +1071,17 @@ async fn test_disconnect_verdicts_close_the_connection_at_every_hook() -> anyhow
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0004-")).await?;
         peer.bitfield(&[0xf0]).await?;
         peer.expect_closed(Duration::from_secs(5)).await?;
+        // The bitfield was recorded before the disconnect: it is the one reported with it.
+        wait_for(
+            "disconnected",
+            || policy.count(|e| matches!(e, Ev::Disconnected(_))) == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(
+            policy.events().last(),
+            Some(&Ev::Disconnected(Some(vec![true; 4])))
+        );
 
         // On a request: nothing is sent.
         let policy = TestPolicy::with_rule(|e| match e {
@@ -1379,7 +1401,7 @@ async fn test_refused_peers_are_not_reconnected_when_more_files_are_selected() -
         .await?;
         assert_eq!(seed_policy.handshakes(), 1);
 
-        // Refused: selecting the second file doesn't bring the seeder back.
+        // Refused: selecting the second file queues the seeder again, and its dial is refused.
         // The client marks the peer as not needed right after it disconnects it.
         tokio::time::sleep(Duration::from_millis(500)).await;
         policy.set_admit(false);
@@ -1389,26 +1411,36 @@ async fn test_refused_peers_are_not_reconnected_when_more_files_are_selected() -
             .session
             .update_only_files(&client.handle, &both)
             .await?;
+        wait_for(
+            "the dial was refused",
+            || blocked_outgoing(&client.session) == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
         assert!(
             policy.admit_calls().len() > calls,
             "the policy was not asked"
         );
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(seed_policy.handshakes(), 1, "refused peer was reconnected");
         assert!(!client.handle.live().context("live")?.is_finished());
 
-        // Admitted again: it is.
+        // Asking again while it is refused dials nothing, and isn't a connection attempt.
+        let (admits, readmits) = (policy.admit_calls().len(), policy.readmit_calls().len());
+        assert_eq!(client.session.readmit_refused_peers(), 0);
+        assert!(policy.readmit_calls().len() > readmits);
+        assert_eq!(policy.admit_calls().len(), admits);
+
+        // Admitted again: it is dialed, the peer was not forgotten.
         policy.set_admit(true);
-        client
-            .session
-            .update_only_files(&client.handle, &both)
-            .await?;
+        assert_eq!(client.session.readmit_refused_peers(), 1);
         timeout(
             Duration::from_secs(20),
             client.handle.wait_until_completed(),
         )
         .await??;
         assert_eq!(seed_policy.handshakes(), 2);
+        assert_eq!(blocked_outgoing(&client.session), 1);
         Ok(())
     })
     .await
@@ -1470,11 +1502,16 @@ async fn test_refused_peer_is_not_redialed_after_a_disconnect() -> anyhow::Resul
         assert_eq!(seed_policy.handshakes(), 1, "refused peer was dialed again");
 
         // Still refused: asking again changes nothing.
-        let asked = policy.admit_calls().len();
+        let (admits, readmits) = (policy.admit_calls().len(), policy.readmit_calls().len());
         assert_eq!(client.session.readmit_refused_peers(), 0);
         assert!(
-            policy.admit_calls().len() > asked,
+            policy.readmit_calls().len() > readmits,
             "the policy was not asked"
+        );
+        assert_eq!(
+            policy.admit_calls().len(),
+            admits,
+            "asking again is not a connection attempt"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(seed_policy.handshakes(), 1, "still refused, but dialed");
@@ -1592,6 +1629,274 @@ async fn test_without_a_policy_connections_are_unaffected() -> anyhow::Result<()
             seed.session.throttled_upload_bps(),
             Some(crate::DEFAULT_THROTTLED_UPLOAD_BPS)
         );
+        Ok(())
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Connections that are cut off without a word
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pausing_the_torrent_reports_the_end_of_its_connections() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::new();
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        })
+        .await?;
+        let mut peer =
+            FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0010-")).await?;
+        wait_for(
+            "connected",
+            || policy.handshakes() == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        seed.session.pause(&seed.handle).await?;
+        peer.expect_closed(Duration::from_secs(5)).await?;
+        wait_for(
+            "disconnected",
+            || policy.count(|e| matches!(e, Ev::Disconnected(_))) == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(policy.count(|e| matches!(e, Ev::Disconnected(_))), 1);
+        let seen = policy.seen.lock();
+        let last = seen.last().unwrap();
+        assert_eq!(last.ev, Ev::Disconnected(None));
+        assert!(last.ctx.we_are_seeding, "seeding state of the torrent");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_removing_the_torrent_reports_the_end_of_its_connections() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::new();
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        })
+        .await?;
+        let mut a = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0011-")).await?;
+        let mut b = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0012-")).await?;
+        // One of them announced something, it is not reported once the task is gone.
+        a.bitfield(&[0xf0]).await?;
+        wait_for(
+            "connected",
+            || policy.handshakes() == 2,
+            Duration::from_secs(5),
+        )
+        .await?;
+
+        seed.session
+            .delete(crate::api::TorrentIdOrHash::Id(seed.handle.id()), false)
+            .await?;
+        a.expect_closed(Duration::from_secs(5)).await?;
+        b.expect_closed(Duration::from_secs(5)).await?;
+        wait_for(
+            "disconnected",
+            || policy.count(|e| matches!(e, Ev::Disconnected(_))) == 2,
+            Duration::from_secs(5),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(policy.count(|e| matches!(e, Ev::Disconnected(_))), 2);
+        Ok(())
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded queues
+// ---------------------------------------------------------------------------------------------
+
+fn flood(blocks: usize) -> Vec<u8> {
+    let mut batch = Vec::with_capacity(blocks * 17);
+    for i in 0..u32::try_from(blocks).unwrap_or(u32::MAX) {
+        let (piece, begin) = ((i / 2) % PIECES, (i % 2) * BLOCK);
+        batch.extend(FakePeer::request_frame(piece, begin, BLOCK));
+    }
+    batch
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_throttled_peer_cannot_queue_unbounded_requests() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::with_rule(|e| match e {
+            Ev::Handshake { .. } => PeerVerdict::Throttle,
+            _ => PeerVerdict::Allow,
+        });
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        })
+        .await?;
+        let mut peer =
+            FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0013-")).await?;
+        peer.send_raw(&flood(10_000)).await?;
+        wait_for(
+            "every request reported",
+            || policy.count(|e| matches!(e, Ev::Request { .. })) == 10_000,
+            Duration::from_secs(20),
+        )
+        .await?;
+        // While the flood was read, served blocks made room for more requests. What is waiting
+        // now is all there is to serve: no more than the queue of a connection holds, though
+        // 10 000 requests came in and the rate would allow many more in this time.
+        let before = uploaded(&seed);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let served_after = (uploaded(&seed) - before) / BLOCK as u64;
+        assert!(
+            served_after <= 4,
+            "{served_after} blocks served after the flood"
+        );
+        // The queue frees up as blocks are served: new requests are accepted again.
+        let (msgs, closed) = peer.collect(Duration::from_millis(100)).await;
+        assert!(!closed);
+        let received = msgs
+            .iter()
+            .filter(|m| matches!(m, Wire::Piece { .. }))
+            .count() as u64;
+        assert_eq!(received * BLOCK as u64, uploaded(&seed));
+        peer.request(3, BLOCK, BLOCK).await?;
+        peer.expect_pieces(1, Duration::from_secs(5)).await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_throttled_peers_take_turns() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::with_rule(|e| match e {
+            Ev::Handshake { .. } => PeerVerdict::Throttle,
+            _ => PeerVerdict::Allow,
+        });
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            ..Default::default()
+        })
+        .await?;
+        let mut a = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0014-")).await?;
+        let mut b = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0015-")).await?;
+        // The first peer floods the queue before the second one asks for anything.
+        a.send_raw(&flood(2_000)).await?;
+        wait_for(
+            "first flood",
+            || policy.count(|e| matches!(e, Ev::Request { .. })) == 2_000,
+            Duration::from_secs(10),
+        )
+        .await?;
+        b.send_raw(&flood(2_000)).await?;
+
+        // (Shorter than the 10 s after which a silent peer is dropped.)
+        let (got_a, got_b) = tokio::join!(
+            a.collect(Duration::from_secs(7)),
+            b.collect(Duration::from_secs(7)),
+        );
+        let pieces = |msgs: &[Wire]| {
+            msgs.iter()
+                .filter(|m| matches!(m, Wire::Piece { .. }))
+                .count()
+        };
+        assert!(!got_a.1 && !got_b.1);
+        let (pa, pb) = (pieces(&got_a.0), pieces(&got_b.0));
+        assert!(pa >= 3, "first peer got {pa} blocks");
+        assert!(pb >= 3, "second peer got {pb} blocks");
+        assert!(pa.abs_diff(pb) <= 6, "unfair: {pa} against {pb}");
+        Ok(())
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Magnet links
+// ---------------------------------------------------------------------------------------------
+
+// Resolving a magnet link dials peers too, to read the metadata from them.
+async fn magnet_dials(
+    policy: Arc<TestPolicy>,
+    seed: &Fixture,
+    peer: SocketAddr,
+) -> anyhow::Result<Arc<Session>> {
+    let dir = TempDir::with_prefix("rqbit_peer_policy_magnet")?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            connect: Some(ConnectionOptions::default()),
+            ipv4_only: true,
+            disable_local_service_discovery: true,
+            mse_mode: MseMode::Disabled,
+            peer_policy: Some(policy as Arc<dyn PeerPolicy>),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let magnet = format!("magnet:?xt=urn:btih:{}", seed.info_hash.as_string());
+    let s = session.clone();
+    // Resolving never finishes: the peer is not a real one.
+    tokio::spawn(async move {
+        let _dir = dir;
+        let _ = s
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    initial_peers: Some(vec![peer]),
+                    ..Default::default()
+                }),
+            )
+            .await;
+    });
+    Ok(session)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_refused_peer_is_not_dialed_to_read_magnet_metadata() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts::default()).await?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let policy = TestPolicy::new();
+        policy.set_admit(false);
+        let session = magnet_dials(policy.clone(), &seed, listener.local_addr()?).await?;
+        wait_for(
+            "refusal",
+            || blocked_outgoing(&session) == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
+        assert!(
+            timeout(Duration::from_millis(1500), listener.accept())
+                .await
+                .is_err(),
+            "a refused address was dialed for its metadata"
+        );
+        assert_eq!(policy.admit_calls(), vec![LOOPBACK]);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_admitted_peer_is_dialed_to_read_magnet_metadata() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts::default()).await?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let policy = TestPolicy::new();
+        let session = magnet_dials(policy.clone(), &seed, listener.local_addr()?).await?;
+        let (_conn, _) = timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .context("an admitted address was not dialed for its metadata")??;
+        assert_eq!(policy.admit_calls(), vec![LOOPBACK]);
+        assert_eq!(blocked_outgoing(&session), 0);
         Ok(())
     })
     .await

@@ -91,7 +91,10 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
-    peer_policy::{PeerEvent, PeerPolicyBinding, PeerVerdict, UploadRequest, canonical_ip},
+    peer_policy::{
+        MAX_QUEUED_THROTTLED_UPLOADS_PER_PEER, MAX_QUEUED_UPLOADS_PER_PEER, PeerEvent,
+        PeerPolicyBinding, PeerVerdict, UploadRequest, canonical_ip,
+    },
     piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -216,6 +219,9 @@ pub struct TorrentStateLive {
     // Outgoing peers the policy refused to dial (they stay queued). `readmit_refused_peers` asks
     // the policy again, since a refusal can be lifted while the torrent is live.
     refused_peers: Mutex<HashSet<SocketAddr>>,
+    // We have every selected piece. Changes with the selection and with completed pieces, and is
+    // read for every event reported to the peer policy.
+    selection_complete: Arc<AtomicBool>,
     ratelimits: Limits,
 }
 
@@ -245,6 +251,8 @@ impl TorrentStateLive {
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
+        let selection_complete =
+            Arc::new(AtomicBool::new(paused.chunk_tracker.get_hns().finished()));
 
         // TODO: make it configurable
         let file_priorities = {
@@ -311,6 +319,7 @@ impl TorrentStateLive {
             ratelimit_upload_tx,
             throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
             refused_peers: Default::default(),
+            selection_complete,
             ratelimits,
         });
 
@@ -894,6 +903,8 @@ impl TorrentStateLive {
             .lock_write("update_only_files")
             .get_pieces_mut()?
             .update_only_files(&self.metadata.file_infos, only_files)?;
+        self.selection_complete
+            .store(hns.finished(), Ordering::Release);
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
@@ -956,6 +967,8 @@ impl TorrentStateLive {
         }
 
         let chunks = locked.get_chunks()?;
+        self.selection_complete
+            .store(chunks.is_finished(), Ordering::Release);
         if chunks.is_finished() {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
@@ -990,19 +1003,9 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
-        let policy = self.shared.options.peer_policy.as_ref();
         self.peers
             .states
             .iter_mut()
-            // Peers the policy refuses must not be pulled back.
-            .filter(|p| {
-                policy.is_none_or(|policy| {
-                    !matches!(p.value().get_state(), PeerState::NotNeeded)
-                        || policy.admit(canonical_ip(
-                            p.value().outgoing_address.unwrap_or(p.value().addr).ip(),
-                        ))
-                })
-            })
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
             .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
             .take_while(|r| r.is_ok())
@@ -1017,7 +1020,7 @@ impl TorrentStateLive {
         let refused: Vec<_> = self.refused_peers.lock().iter().copied().collect();
         let mut dialed = 0;
         for addr in refused {
-            if !policy.admit(canonical_ip(addr.ip())) {
+            if !policy.readmit(canonical_ip(addr.ip())) {
                 continue;
             }
             self.refused_peers.lock().remove(&addr);
@@ -1055,6 +1058,7 @@ impl TorrentStateLive {
             addr,
             self.metadata.info.info().private,
             &self.lengths,
+            self.selection_complete.clone(),
             tx.clone(),
         )
     }
@@ -1410,6 +1414,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         {
             handshake.metadata_size = Some(len);
         }
+        // How many requests we queue for a peer, see MAX_QUEUED_UPLOADS_PER_PEER.
+        handshake.reqq = Some(MAX_QUEUED_UPLOADS_PER_PEER);
 
         Ok(())
     }
@@ -1643,7 +1649,7 @@ impl PeerHandler {
     }
 
     fn policy_event(&self, event: PeerEvent<'_>) -> anyhow::Result<()> {
-        self.policy.dispatch(|| self.state.is_finished(), event)
+        self.policy.dispatch(event)
     }
 
     fn notify_disconnected(&self) {
@@ -1657,7 +1663,7 @@ impl PeerHandler {
         let bits = bitfield
             .as_ref()
             .and_then(|b| b.get(..self.state.lengths.total_pieces() as usize));
-        self.policy.disconnected(|| self.state.is_finished(), bits);
+        self.policy.disconnected(bits);
     }
 
     fn on_cancel(&self, cancel: Request) -> anyhow::Result<()> {
@@ -1738,7 +1744,14 @@ impl PeerHandler {
             // Choked by the policy: the request is ignored, the connection stays.
             return Ok(());
         }
-        gate.register((request.index, request.begin, request.length));
+        let max_queued = match level {
+            PeerVerdict::Throttle => MAX_QUEUED_THROTTLED_UPLOADS_PER_PEER,
+            _ => MAX_QUEUED_UPLOADS_PER_PEER,
+        };
+        if !gate.register((request.index, request.begin, request.length), max_queued) {
+            // Too many requests of this connection wait already. The peer has to ask again.
+            return Ok(());
+        }
         let queue = match level {
             PeerVerdict::Throttle => self
                 .state
@@ -1807,13 +1820,19 @@ impl PeerHandler {
         {
             debug!("peer has full torrent");
         }
-        if let Some(bits) = bf.get(..self.state.lengths.total_pieces() as usize) {
-            self.policy_event(PeerEvent::Bitfield { bits })?;
-        }
+        let event_bits = self.policy.is_active().then(|| bf.clone());
         self.state
             .peers
             .update_bitfield(self.addr, bf, self.state.lengths.total_pieces() as usize);
         self.on_bitfield_notify.notify_waiters();
+        // After the update: when the policy disconnects the peer for it, the bitfield is the one
+        // reported with the disconnect.
+        if let Some(bits) = event_bits
+            .as_ref()
+            .and_then(|b| b.get(..self.state.lengths.total_pieces() as usize))
+        {
+            self.policy_event(PeerEvent::Bitfield { bits })?;
+        }
         Ok(())
     }
 
