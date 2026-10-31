@@ -213,6 +213,9 @@ pub struct TorrentStateLive {
     ratelimit_upload_tx: UnboundedSender<UploadRequest>,
     // Upload requests of the peers the policy throttled. Only exists with a peer policy.
     throttled_upload_tx: Option<UnboundedSender<UploadRequest>>,
+    // Outgoing peers the policy refused to dial (they stay queued). `readmit_refused_peers` asks
+    // the policy again, since a refusal can be lifted while the torrent is live.
+    refused_peers: Mutex<HashSet<SocketAddr>>,
     ratelimits: Limits,
 }
 
@@ -307,6 +310,7 @@ impl TorrentStateLive {
                 .collect(),
             ratelimit_upload_tx,
             throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
+            refused_peers: Default::default(),
             ratelimits,
         });
 
@@ -721,6 +725,7 @@ impl TorrentStateLive {
             if let Some(policy) = state.shared.options.peer_policy.as_ref()
                 && !policy.admit(canonical_ip(addr.ip()))
             {
+                state.refused_peers.lock().insert(addr);
                 session
                     .stats
                     .counters
@@ -1002,6 +1007,30 @@ impl TorrentStateLive {
             .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
             .take_while(|r| r.is_ok())
             .last();
+    }
+
+    /// Dials the queued peers the policy refused earlier and admits now. Returns how many.
+    pub(crate) fn readmit_refused_peers(&self) -> usize {
+        let Some(policy) = self.shared.options.peer_policy.as_ref() else {
+            return 0;
+        };
+        let refused: Vec<_> = self.refused_peers.lock().iter().copied().collect();
+        let mut dialed = 0;
+        for addr in refused {
+            if !policy.admit(canonical_ip(addr.ip())) {
+                continue;
+            }
+            self.refused_peers.lock().remove(&addr);
+            // It may have connected to us, or been forgotten, in the meantime.
+            let queued = self
+                .peers
+                .with_peer(addr, |p| matches!(p.get_state(), PeerState::Queued))
+                .unwrap_or(false);
+            if queued && self.peer_queue_tx.send(addr).is_ok() {
+                dialed += 1;
+            }
+        }
+        dialed
     }
 
     /// Asks every live peer whose address satisfies `f` to disconnect. Returns how many were asked.

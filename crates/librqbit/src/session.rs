@@ -1813,6 +1813,18 @@ impl Session {
             .sum()
     }
 
+    /// Asks [`PeerPolicy::admit`] again about the outgoing peers it refused earlier and dials
+    /// the ones it admits now (a ban was lifted or expired). Returns how many were queued for
+    /// dialing. Call it whenever the policy admits more than before.
+    pub fn readmit_refused_peers(&self) -> usize {
+        let torrents: Vec<_> = self.db.read().torrents.values().cloned().collect();
+        torrents
+            .iter()
+            .filter_map(|t| t.live())
+            .map(|live| live.readmit_refused_peers())
+            .sum()
+    }
+
     /// The rate shared by all connections the [`PeerPolicy`] throttled. `None` means unlimited.
     pub fn throttled_upload_bps(&self) -> Option<NonZeroU32> {
         self.throttled_upload.get()

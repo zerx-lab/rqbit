@@ -1468,6 +1468,54 @@ async fn test_refused_peer_is_not_redialed_after_a_disconnect() -> anyhow::Resul
         .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(seed_policy.handshakes(), 1, "refused peer was dialed again");
+
+        // Still refused: asking again changes nothing.
+        let asked = policy.admit_calls().len();
+        assert_eq!(client.session.readmit_refused_peers(), 0);
+        assert!(
+            policy.admit_calls().len() > asked,
+            "the policy was not asked"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(seed_policy.handshakes(), 1, "still refused, but dialed");
+
+        // The refusal is lifted: the peer is dialed, in the same live session.
+        policy.set_admit(true);
+        assert_eq!(client.session.readmit_refused_peers(), 1);
+        wait_for(
+            "redial",
+            || seed_policy.handshakes() == 2,
+            Duration::from_secs(10),
+        )
+        .await?;
+        // Nothing is waiting any longer.
+        assert_eq!(client.session.readmit_refused_peers(), 0);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_readmit_without_a_policy_or_refusals_does_nothing() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder(SeederOpts::default()).await?;
+        assert_eq!(seed.session.readmit_refused_peers(), 0);
+        let policy = TestPolicy::new();
+        let client = start_client(
+            &seed,
+            ClientOpts {
+                policy: Some(policy.clone()),
+                initial_peers: vec![seed.addr()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        timeout(
+            Duration::from_secs(20),
+            client.handle.wait_until_completed(),
+        )
+        .await??;
+        assert_eq!(client.session.readmit_refused_peers(), 0);
         Ok(())
     })
     .await
