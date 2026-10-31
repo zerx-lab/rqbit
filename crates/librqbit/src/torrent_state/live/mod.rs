@@ -91,6 +91,7 @@ use crate::{
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
+    peer_policy::{PeerEvent, PeerPolicyBinding, PeerVerdict, UploadRequest, canonical_ip},
     piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
@@ -209,10 +210,9 @@ pub struct TorrentStateLive {
     pub(crate) streams: Arc<TorrentStreams>,
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
-    ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
-        tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-        ChunkInfo,
-    )>,
+    ratelimit_upload_tx: UnboundedSender<UploadRequest>,
+    // Upload requests of the peers the policy throttled. Only exists with a peer policy.
+    throttled_upload_tx: Option<UnboundedSender<UploadRequest>>,
     ratelimits: Limits,
 }
 
@@ -259,10 +259,13 @@ impl TorrentStateLive {
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
-        let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>();
+        let (ratelimit_upload_tx, ratelimit_upload_rx) = unbounded_channel::<UploadRequest>();
+        let throttled_upload = paused
+            .shared
+            .options
+            .peer_policy
+            .is_some()
+            .then(unbounded_channel::<UploadRequest>);
         let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
@@ -303,6 +306,7 @@ impl TorrentStateLive {
                 .map(|_| RwLock::new(()))
                 .collect(),
             ratelimit_upload_tx,
+            throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
             ratelimits,
         });
 
@@ -345,8 +349,18 @@ impl TorrentStateLive {
         state.spawn(
             debug_span!(parent: state.shared.span.clone(), "upload_scheduler"),
             format!("[{}]upload_scheduler", state.shared.id),
-            state.clone().task_upload_scheduler(ratelimit_upload_rx),
+            state
+                .clone()
+                .task_upload_scheduler(ratelimit_upload_rx, false),
         );
+
+        if let Some((_, throttled_rx)) = throttled_upload {
+            state.spawn(
+                debug_span!(parent: state.shared.span.clone(), "throttled_upload_scheduler"),
+                format!("[{}]throttled_upload_scheduler", state.shared.id),
+                state.clone().task_upload_scheduler(throttled_rx, true),
+            );
+        }
         Ok(state)
     }
 
@@ -441,14 +455,23 @@ impl TorrentStateLive {
         Ok(AddIncomingPeerResult::Added)
     }
 
+    // Paces the upload requests of one queue. Normal peers and throttled peers each have their own
+    // queue (and task), so waiting for the throttled rate never holds back a normal peer.
     async fn task_upload_scheduler(
         self: Arc<Self>,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<(
-            tokio::sync::mpsc::UnboundedSender<WriterRequest>,
-            ChunkInfo,
-        )>,
+        mut rx: UnboundedReceiver<UploadRequest>,
+        throttled: bool,
     ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+        while let Some(UploadRequest {
+            tx,
+            chunk: ci,
+            gate,
+        }) = rx.recv().await
+        {
+            // The peer may have cancelled it, or the policy dropped it, while it was queued.
+            if !gate.keep(&ci) {
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;
@@ -466,6 +489,27 @@ impl TorrentStateLive {
                         res?;
                     }
                 }
+                if throttled {
+                    tokio::select! {
+                        _ = tx.closed() => {
+                            continue;
+                        }
+                        res = session.throttled_upload.acquire(NonZeroU32::new(ci.size).unwrap()) => {
+                            if let Err(e) = res {
+                                warn!(
+                                    id = self.shared.id,
+                                    info_hash = ?self.shared.info_hash,
+                                    "dropping a throttled upload request: {e:#}"
+                                );
+                                gate.should_upload(&ci);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if !gate.keep(&ci) {
+                continue;
             }
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
@@ -483,6 +527,7 @@ impl TorrentStateLive {
         let handler = PeerHandler {
             addr: checked_peer.addr,
             incoming: true,
+            policy: self.peer_policy_binding(checked_peer.addr, &tx),
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
@@ -519,6 +564,7 @@ impl TorrentStateLive {
                 self.have_broadcast_tx.subscribe()
             ) => {r}
         };
+        handler.notify_disconnected();
 
         match res {
             // We disconnected the peer ourselves as we don't need it
@@ -549,6 +595,7 @@ impl TorrentStateLive {
         let handler = PeerHandler {
             addr,
             incoming: false,
+            policy: state.peer_policy_binding(addr, &tx),
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
@@ -595,6 +642,7 @@ impl TorrentStateLive {
             r = requester => {r}
             r = conn_manager => {r}
         };
+        handler.notify_disconnected();
 
         match res {
             // We disconnected the peer ourselves as we don't need it
@@ -667,6 +715,18 @@ impl TorrentStateLive {
                     .blocked_outgoing
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(?addr, "blocked outgoing connection (by the allowlist)");
+                continue;
+            }
+
+            if let Some(policy) = state.shared.options.peer_policy.as_ref()
+                && !policy.admit(canonical_ip(addr.ip()))
+            {
+                session
+                    .stats
+                    .counters
+                    .blocked_outgoing
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(?addr, "blocked outgoing connection (by the peer policy)");
                 continue;
             }
 
@@ -925,13 +985,49 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
+        let policy = self.shared.options.peer_policy.as_ref();
         self.peers
             .states
             .iter_mut()
+            // Peers the policy refuses must not be pulled back.
+            .filter(|p| {
+                policy.is_none_or(|policy| {
+                    !matches!(p.value().get_state(), PeerState::NotNeeded)
+                        || policy.admit(canonical_ip(
+                            p.value().outgoing_address.unwrap_or(p.value().addr).ip(),
+                        ))
+                })
+            })
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
             .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
             .take_while(|r| r.is_ok())
             .last();
+    }
+
+    /// Asks every live peer whose address satisfies `f` to disconnect. Returns how many were asked.
+    pub(crate) fn disconnect_peers_where(&self, f: &impl Fn(IpAddr) -> bool) -> usize {
+        // `f` runs without holding the peer table.
+        let live: Vec<_> = self
+            .peers
+            .states
+            .iter()
+            .filter_map(|p| Some((canonical_ip(p.key().ip()), p.value().get_live()?.tx.clone())))
+            .collect();
+        live.into_iter()
+            .filter(|(ip, _)| f(*ip))
+            .filter(|(_, tx)| tx.send(WriterRequest::Disconnect(Ok(()))).is_ok())
+            .count()
+    }
+
+    fn peer_policy_binding(&self, addr: SocketAddr, tx: &PeerTx) -> PeerPolicyBinding {
+        PeerPolicyBinding::new(
+            self.shared.options.peer_policy.clone(),
+            self.shared.info_hash,
+            addr,
+            self.metadata.info.info().private,
+            &self.lengths,
+            tx.clone(),
+        )
     }
 
     async fn task_send_pex_to_peer(
@@ -1054,6 +1150,7 @@ struct PeerHandler {
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
+    policy: PeerPolicyBinding,
 
     first_message_received: AtomicBool,
 
@@ -1100,13 +1197,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::KeepAlive => {
                 trace!("keepalive received");
             }
-            Message::Have(h) => self.on_have(h),
+            Message::Have(h) => self.on_have(h)?,
             Message::NotInterested => {
                 trace!("received \"not interested\", but we don't process it yet")
             }
-            Message::Cancel(_) => {
-                trace!("received \"cancel\", but we don't process it yet")
-            }
+            Message::Cancel(cancel) => self.on_cancel(cancel)?,
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
             ))) => {
@@ -1156,8 +1251,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
+        let (peer_id, reserved) = (handshake.peer_id, handshake.reserved);
         self.state.set_peer_live(self.addr, handshake, ckind);
-        Ok(())
+        self.policy.mark_established();
+        self.policy_event(PeerEvent::Handshake {
+            peer_id,
+            reserved,
+            incoming: self.incoming,
+        })
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {
@@ -1175,6 +1276,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    fn should_upload_chunk(&self, chunk: &ChunkInfo) -> bool {
+        self.policy.gate().should_upload(chunk)
+    }
+
+    fn on_uploaded_chunk(&self, chunk: &ChunkInfo) -> anyhow::Result<()> {
+        self.policy_event(PeerEvent::Uploaded {
+            piece: chunk.piece_index.get(),
+            begin: chunk.offset,
+            length: chunk.size,
+        })
+    }
+
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
         self.state.file_ops().read_chunk(self.addr, chunk, buf)
     }
@@ -1187,6 +1300,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     live.client_name = Some(client_name);
                 });
         }
+        self.policy_event(PeerEvent::ExtendedHandshake {
+            client: hs
+                .v
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v.as_ref()))
+                .as_deref(),
+        })?;
 
         if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
             && reqq > 0
@@ -1244,18 +1364,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.get_approx_have_bytes() > 0
     }
 
-    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
-        if self.state.shared.options.disable_upload() {
-            return false;
-        }
-        let have = self
-            .state
-            .peers
-            .with_live(self.addr, |l| {
-                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
-            })
-            .unwrap_or(true);
-        !have
+    fn should_transmit_have(&self, _id: ValidPieceIndex) -> bool {
+        // Always announce, even a piece the peer's bitfield already covers: leaving HAVEs out
+        // makes us look like a peer that doesn't report its progress, which anti-leech tools
+        // flag.
+        !self.state.shared.options.disable_upload()
     }
 
     fn update_my_extended_handshake(
@@ -1500,6 +1613,38 @@ impl PeerHandler {
         result
     }
 
+    fn policy_event(&self, event: PeerEvent<'_>) -> anyhow::Result<()> {
+        self.policy.dispatch(|| self.state.is_finished(), event)
+    }
+
+    fn notify_disconnected(&self) {
+        if !self.policy.is_active() {
+            return;
+        }
+        let bitfield = self
+            .state
+            .peers
+            .with_live(self.addr, |l| l.bitfield.clone());
+        let bits = bitfield
+            .as_ref()
+            .and_then(|b| b.get(..self.state.lengths.total_pieces() as usize));
+        self.policy.disconnected(|| self.state.is_finished(), bits);
+    }
+
+    fn on_cancel(&self, cancel: Request) -> anyhow::Result<()> {
+        self.policy
+            .gate()
+            .cancel((cancel.index, cancel.begin, cancel.length));
+        if cancel.index < self.policy.num_pieces() {
+            self.policy_event(PeerEvent::Cancel {
+                piece: cancel.index,
+                begin: cancel.begin,
+                length: cancel.length,
+            })?;
+        }
+        Ok(())
+    }
+
     fn on_download_request(&self, request: Request) -> anyhow::Result<()> {
         if self.state.torrent().options.disable_upload() {
             anyhow::bail!("upload disabled, but peer requested a piece")
@@ -1541,13 +1686,47 @@ impl PeerHandler {
             );
         }
 
-        self.state
-            .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+        let peer_claims_piece = self.policy.is_active()
+            && self
+                .state
+                .peers
+                .with_live(self.addr, |live| {
+                    live.bitfield
+                        .get(request.index as usize)
+                        .is_some_and(|bit| *bit)
+                })
+                .unwrap_or_default();
+        self.policy_event(PeerEvent::Request {
+            piece: request.index,
+            begin: request.begin,
+            length: request.length,
+            peer_claims_piece,
+        })?;
+
+        let gate = self.policy.gate();
+        let level = gate.level();
+        if level >= PeerVerdict::Choke {
+            // Choked by the policy: the request is ignored, the connection stays.
+            return Ok(());
+        }
+        gate.register((request.index, request.begin, request.length));
+        let queue = match level {
+            PeerVerdict::Throttle => self
+                .state
+                .throttled_upload_tx
+                .as_ref()
+                .unwrap_or(&self.state.ratelimit_upload_tx),
+            _ => &self.state.ratelimit_upload_tx,
+        };
+        queue.send(UploadRequest {
+            tx: self.tx.clone(),
+            chunk: chunk_info,
+            gate: gate.clone(),
+        })?;
         Ok(())
     }
 
-    fn on_have(&self, have: u32) {
+    fn on_have(&self, have: u32) -> anyhow::Result<()> {
         self.state
             .peers
             .with_live_mut(self.addr, "on_have", |live| {
@@ -1578,6 +1757,10 @@ impl PeerHandler {
                 }
             });
         self.on_bitfield_notify.notify_waiters();
+        if have < self.policy.num_pieces() {
+            self.policy_event(PeerEvent::Have { piece: have })?;
+        }
+        Ok(())
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
@@ -1594,6 +1777,9 @@ impl PeerHandler {
             .map(|s| s.all())
         {
             debug!("peer has full torrent");
+        }
+        if let Some(bits) = bf.get(..self.state.lengths.total_pieces() as usize) {
+            self.policy_event(PeerEvent::Bitfield { bits })?;
         }
         self.state
             .peers

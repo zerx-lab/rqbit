@@ -2,7 +2,8 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -25,6 +26,7 @@ use crate::{
     merge_streams::merge_streams,
     mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
+    peer_policy::{PeerPolicy, ThrottledUpload, canonical_ip},
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
@@ -144,6 +146,8 @@ pub struct Session {
 
     pub blocklist: IpRanges,
     pub allowlist: Option<IpRanges>,
+    pub(crate) peer_policy: Option<Arc<dyn PeerPolicy>>,
+    pub(crate) throttled_upload: ThrottledUpload,
 
     // Monitoring / tracing / logging
     pub(crate) stats: Arc<SessionStats>,
@@ -500,6 +504,10 @@ pub struct SessionOptions {
     /// Backoff config for dead outgoing peers. `None` uses the upstream
     /// defaults (min 10s, factor 6, max 3600s, total 24h).
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
+
+    /// Decides which peers may connect and what each connection may do, see [`PeerPolicy`].
+    /// `None` (the default) means every peer is welcome.
+    pub peer_policy: Option<Arc<dyn PeerPolicy>>,
 }
 
 impl Default for SessionOptions {
@@ -530,6 +538,7 @@ impl Default for SessionOptions {
             client_name_and_version: None,
             mse_mode: MseMode::default(),
             peer_backoff: None,
+            peer_policy: None,
         }
     }
 }
@@ -840,6 +849,8 @@ impl Session {
                 _disable_upload: opts.disable_upload,
                 blocklist,
                 allowlist,
+                peer_policy: opts.peer_policy,
+                throttled_upload: ThrottledUpload::new(),
                 lsd,
             });
 
@@ -959,6 +970,15 @@ impl Session {
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
             bail!("Incoming ip {incoming_ip} is not in allowlist");
+        }
+        if let Some(policy) = self.peer_policy.as_ref()
+            && !policy.admit(canonical_ip(incoming_ip))
+        {
+            self.stats
+                .counters
+                .blocked_incoming
+                .fetch_add(1, Ordering::Relaxed);
+            bail!("Incoming ip {incoming_ip} is refused by the peer policy");
         }
 
         if self.mse_mode == MseMode::Disabled {
@@ -1502,6 +1522,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    peer_policy: self.peer_policy.clone(),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
@@ -1777,6 +1798,30 @@ impl Session {
 
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port
+    }
+
+    /// Closes the live connections to every peer whose address satisfies `f` (IPv4-mapped IPv6
+    /// addresses are passed as plain IPv4). Returns how many connections were closed.
+    /// Outgoing peers may be dialed again later if [`PeerPolicy::admit`] allows it.
+    pub fn disconnect_peers_where(&self, f: impl Fn(IpAddr) -> bool) -> usize {
+        // Don't hold the database lock while walking the peers.
+        let torrents: Vec<_> = self.db.read().torrents.values().cloned().collect();
+        torrents
+            .iter()
+            .filter_map(|t| t.live())
+            .map(|live| live.disconnect_peers_where(&f))
+            .sum()
+    }
+
+    /// The rate shared by all connections the [`PeerPolicy`] throttled. `None` means unlimited.
+    pub fn throttled_upload_bps(&self) -> Option<NonZeroU32> {
+        self.throttled_upload.get()
+    }
+
+    /// Sets the rate shared by all connections the [`PeerPolicy`] throttled; takes effect
+    /// immediately. The default is [`DEFAULT_THROTTLED_UPLOAD_BPS`](crate::DEFAULT_THROTTLED_UPLOAD_BPS).
+    pub fn set_throttled_upload_bps(&self, bps: Option<NonZeroU32>) {
+        self.throttled_upload.set(bps);
     }
 
     async fn resolve_magnet(

@@ -122,6 +122,8 @@ pub(crate) struct ManagedTorrentOptions {
     /// Backoff config for dead outgoing peers; None = upstream defaults.
     pub peer_backoff: Option<crate::PeerBackoffConfig>,
     pub peer_max_request_window: Option<usize>,
+    /// Per-peer admission / upload policy installed on the session.
+    pub peer_policy: Option<Arc<dyn crate::PeerPolicy>>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,
