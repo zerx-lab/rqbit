@@ -1409,9 +1409,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn should_transmit_have(&self, _id: ValidPieceIndex) -> bool {
-        // Always announce, even a piece the peer's bitfield already covers: leaving HAVEs out
-        // makes us look like a peer that doesn't report its progress, which anti-leech tools
-        // flag.
+        // Announce every completed piece, also one the peer's bitfield already claims. Leaving
+        // such HAVEs out makes us look like a peer that doesn't report its progress, which
+        // anti-leech tools (e.g. PeerBanHelper's ProgressCheatBlocker) take as a cheating
+        // client and ban.
         !self.state.shared.options.disable_upload()
     }
 
