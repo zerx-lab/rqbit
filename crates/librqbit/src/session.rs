@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::Read,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
@@ -13,34 +13,36 @@ use std::{
 };
 
 use crate::{
-    ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared, PiecePicking,
+    ApiError, CreateTorrentOptions, ManagedTorrent, ManagedTorrentShared, PiecePicking,
     UploadSlots,
     api::TorrentIdOrHash,
     api_error::WithStatus,
     bitv_factory::{BitVFactory, NonPersistentBitVFactory},
+    connection_limit::{ConnectionLimit, PeerPermits},
     create_torrent,
     create_torrent_file::CreateTorrentResult,
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
-    listen::{Accept, ListenerOptions},
+    listen::{Accept, ListenResult, ListenerOptions},
     merge_streams::merge_streams,
     mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
     peer_policy::{PeerPolicy, ThrottledUpload, canonical_ip},
+    priority::Priorities,
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
     spawn_utils::BlockingSpawner,
     storage::{
-        BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
+        BoxStorageFactory, MoveStorageMode, MoveStorageRequest, StorageFactoryExt, TorrentStorage,
+        filesystem::FilesystemStorageFactory,
     },
-    stream_connect::{
-        ConnectionKind, ConnectionOptions, SocksProxyConfig, StreamConnector, StreamConnectorArgs,
-    },
+    stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive, alt_info_hash, initializing::TorrentStateInitializing,
+        StorageLocation, TorrentMetadata, TorrentStateLive, alt_info_hash,
+        initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
     vectored_traits::AsyncReadVectoredIntoCompat,
@@ -65,12 +67,16 @@ use librqbit_core::{
     hash_id::Id32,
     magnet::Magnet,
     peer_id::generate_azereus_style,
+    proxy::ProxyConfig,
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, compute_info_hashes},
 };
 use librqbit_lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
+use librqbit_upnp::{
+    PortMapper, PortMappingMethods, PortMappingOptions, PortMappingProtocol, PortMappingStatus,
+};
 use librqbit_utp::BindDevice;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
 use sha1w::{ISha1, Sha1};
@@ -78,11 +84,28 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{
+    TorrentTrackers, TrackerAnnounceOptions, TrackerCommsParams, TrackerTimings, UdpTrackerClient,
+};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
+/// How many peers a torrent may have connecting or connected at a time when neither the
+/// torrent nor the session sets a limit.
+pub const DEFAULT_PEER_LIMIT: usize = 128;
+
 pub type TorrentId = usize;
+
+// How long an incoming connection that has a torrent permit may queue for a session permit
+// before it is refused. Short: the peer waits for our handshake meanwhile.
+const INCOMING_SESSION_SLOT_WAIT: Duration = Duration::from_secs(3);
+
+// A checked incoming connection, with its permits if the limits let it in.
+type IncomingCheck = (
+    Arc<TorrentStateLive>,
+    CheckedIncomingConnection,
+    Option<PeerPermits>,
+);
 
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
@@ -128,6 +151,7 @@ pub struct Session {
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
+    tracker_announce: TrackerAnnounceOptions,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -164,6 +188,16 @@ pub struct Session {
     client_name_and_version: String,
     mse_mode: MseMode,
     peer_backoff: Option<crate::PeerBackoffConfig>,
+    port_mapper: Option<SessionPortMapper>,
+}
+
+/// The port mapper of a session and what [`Session::stop`] needs to wait for it.
+struct SessionPortMapper {
+    mapper: PortMapper,
+    /// Cancelled when the mapper task has deleted the mappings and returned.
+    stopped: CancellationToken,
+    /// How long [`Session::stop`] waits for that: the mapper's own deletion bound plus slack.
+    stop_timeout: Duration,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -294,13 +328,17 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub disable_trackers: bool,
 
+    /// The torrent's own rate limits, enforced in addition to the session ones. Can be changed
+    /// later with [`Session::set_torrent_ratelimits`].
     #[serde(default)]
     pub ratelimits: LimitsConfig,
 
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
 
-    /// Max concurrent connected peers.
+    /// Max concurrent connecting + connected peers of this torrent. `None`: the session's
+    /// default ([`SessionOptions::peer_limit`]). Can be changed later with
+    /// [`Session::set_torrent_peer_limit`].
     pub peer_limit: Option<usize>,
 
     /// This is used to restore the session from serialized state.
@@ -316,6 +354,37 @@ pub struct AddTorrentOptions {
     /// Can be changed later with [`Session::set_piece_picking`].
     #[serde(default)]
     pub piece_picking: PiecePicking,
+
+    /// Seed mode: if there's no valid fastresume bitfield and every selected file already
+    /// exists with exactly its expected length, take every selected piece as present without
+    /// hashing anything (pieces shared with an unselected file that isn't complete on disk
+    /// excepted). For content the user knows is complete, e.g. re-seeding after moving it or
+    /// a torrent just created from it. If a selected file is missing or has another length,
+    /// the files are checked as usual. Needs [`Self::overwrite`] like any add over existing
+    /// files. Not kept: once added, the stored bitfield says what the torrent has.
+    #[serde(default)]
+    pub skip_initial_check: bool,
+
+    /// Files stored under another path than the torrent gives them, by file index, with
+    /// that path relative to the output folder (see [`Session::rename_file`]). This is how
+    /// session persistence restores renames; the paths are validated like a rename's.
+    #[serde(default)]
+    pub renamed_files: BTreeMap<usize, PathBuf>,
+
+    /// The download priority of each file, by file index, in `0..=7` (see [`crate::Priority`]):
+    /// 0 is not downloaded, 1 normal, 6 high, 7 maximum. Files past the end of the list are
+    /// normal; a list longer than the torrent's files, or a level above 7, is an error.
+    ///
+    /// With `only_files` / `only_files_regex` as well, the files they leave out are 0 and the
+    /// files they select take their level from here, a 0 counting as normal (the file was
+    /// selected). Can be changed later with [`Session::set_file_priorities`].
+    #[serde(default)]
+    pub file_priorities: Option<Vec<u8>>,
+
+    /// Explicit priorities of single pieces, `(piece index, level)`, overriding the level the
+    /// piece gets from its files. Can be changed later with [`Session::set_piece_priorities`].
+    #[serde(default)]
+    pub piece_priorities: Option<Vec<(u32, u8)>>,
 }
 
 pub struct ListOnlyResponse {
@@ -430,6 +499,9 @@ pub struct DhtSessionConfig {
     pub port: Option<u16>,
     /// Persistence behavior. If None, persistence is disabled.
     pub persistence: Option<DhtPersistenceConfig>,
+    /// BEP 42 enforcement: DHT nodes whose id does not match their IP address are kept out of
+    /// the routing table and never become announce targets. Off by default.
+    pub enforce_node_id: bool,
 }
 
 impl Default for DhtSessionConfig {
@@ -438,6 +510,7 @@ impl Default for DhtSessionConfig {
             bootstrap_addrs: None,
             port: None,
             persistence: Some(DhtPersistenceConfig::default()),
+            enforce_node_id: false,
         }
     }
 }
@@ -491,8 +564,20 @@ pub struct SessionOptions {
     // The list of tracker URLs to always use for each torrent.
     pub trackers: HashSet<url::Url>,
 
-    /// Default peer limit per torrent.
+    /// How announces are spread over the tiers and the trackers of a tier. The default
+    /// announces to every tracker; see [`TrackerAnnounceOptions`].
+    pub tracker_announce: TrackerAnnounceOptions,
+
+    /// Default peer limit per torrent ([`DEFAULT_PEER_LIMIT`] if not set): how many peers each
+    /// torrent may have connecting or connected at a time. A torrent can override it, see
+    /// [`AddTorrentOptions::peer_limit`].
     pub peer_limit: Option<usize>,
+
+    /// How many peers all torrents of the session together may have connecting or connected at
+    /// a time, on top of each torrent's own limit. The connections that fetch the metadata of a
+    /// magnet link count as well. `None` (the default): no session-wide limit.
+    /// Can be changed later with [`Session::set_global_peer_limit`].
+    pub global_peer_limit: Option<usize>,
 
     /// How many peers each torrent uploads to at a time, see [`UploadSlots`].
     pub upload_slots: UploadSlots,
@@ -521,6 +606,9 @@ pub struct SessionOptions {
     /// Decides which peers may connect and what each connection may do, see [`PeerPolicy`].
     /// `None` (the default) means every peer is welcome.
     pub peer_policy: Option<Arc<dyn PeerPolicy>>,
+    /// Do not advertise the Fast Extension (BEP 6). Default off: handshakes set the bit, and a
+    /// connection uses Fast when the peer set it too.
+    pub disable_fast_extension: bool,
 }
 
 impl Default for SessionOptions {
@@ -543,7 +631,9 @@ impl Default for SessionOptions {
             blocklist_url: None,
             allowlist_url: None,
             trackers: HashSet::new(),
+            tracker_announce: TrackerAnnounceOptions::default(),
             peer_limit: None,
+            global_peer_limit: None,
             upload_slots: UploadSlots::default(),
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
@@ -553,24 +643,33 @@ impl Default for SessionOptions {
             mse_mode: MseMode::default(),
             peer_backoff: None,
             peer_policy: None,
+            disable_fast_extension: false,
         }
     }
 }
 
-fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
+fn torrent_file_from_info_bytes(
+    info_bytes: &[u8],
+    tiers: &[Vec<url::Url>],
+) -> anyhow::Result<Bytes> {
     #[derive(Serialize)]
     struct Tmp<'a> {
         announce: &'a str,
         #[serde(rename = "announce-list")]
-        announce_list: &'a [&'a [url::Url]],
+        announce_list: &'a [Vec<url::Url>],
         info: bencode::raw_value::RawValue<&'a [u8]>,
     }
 
     let mut w = Vec::new();
     let v = Tmp {
         info: bencode::raw_value::RawValue(info_bytes),
-        announce: trackers.first().map(|s| s.as_str()).unwrap_or(""),
-        announce_list: &[trackers],
+        announce: tiers
+            .iter()
+            .flatten()
+            .next()
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+        announce_list: tiers,
     };
     bencode_serialize_to_writer(&v, &mut w)?;
     Ok(w.into())
@@ -589,7 +688,7 @@ struct InternalAddResult {
     info_hash: Id20,
     info_hash_v2: Option<Id32>,
     metadata: Option<TorrentMetadata>,
-    trackers: Vec<url::Url>,
+    tiers: Vec<Vec<url::Url>>,
     name: Option<String>,
 }
 
@@ -635,7 +734,22 @@ impl Session {
                 None => None,
             };
 
-            let listen_result = if let Some(listen_opts) = opts.listen.take() {
+            // One parsed proxy for every consumer. Tracker traffic always goes through it;
+            // peers and the DHT only with `proxy_peer_connections`.
+            let proxy_config = opts
+                .connect
+                .as_ref()
+                .and_then(|s| s.proxy_url.as_deref())
+                .map(ProxyConfig::parse)
+                .transpose()
+                .context("error parsing the proxy URL")?;
+            let peer_proxy = proxy_config.clone().filter(|_| {
+                opts.connect
+                    .as_ref()
+                    .is_none_or(|c| c.proxy_peer_connections)
+            });
+
+            let mut listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
                         .start(
@@ -650,15 +764,33 @@ impl Session {
                 None
             };
 
-            let dht = if let Some(dht_config) = opts.dht.take() {
+            // The DHT follows the peers: behind their proxy it goes through UDP ASSOCIATE, and a
+            // proxy that can't relay UDP turns it off rather than letting it talk directly.
+            let dht_config = opts.dht.take().filter(|_| match peer_proxy.as_ref() {
+                Some(proxy) if !proxy.kind().can_relay_udp() => {
+                    warn!(
+                        proxy = %proxy,
+                        "DHT disabled: {} proxies cannot relay UDP",
+                        proxy.kind().scheme()
+                    );
+                    false
+                }
+                _ => true,
+            });
+            let dht = if let Some(dht_config) = dht_config {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
-                    PersistentDht::create(
+                    PersistentDht::create_with_config(
                         persistence_config,
                         dht_config.port,
                         opts.ipv4_only,
-                        dht_config.bootstrap_addrs,
-                        Some(token.clone()),
-                        bind_device.as_ref(),
+                        DhtConfig {
+                            bootstrap_addrs: dht_config.bootstrap_addrs,
+                            cancellation_token: Some(token.clone()),
+                            bind_device: bind_device.as_ref(),
+                            enforce_node_id: dht_config.enforce_node_id,
+                            proxy: peer_proxy.as_ref(),
+                            ..Default::default()
+                        },
                     )
                     .await
                     .context("error initializing persistent DHT")?
@@ -669,6 +801,8 @@ impl Session {
                         cancellation_token: Some(token.child_token()),
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
+                        enforce_node_id: dht_config.enforce_node_id,
+                        proxy: peer_proxy.as_ref(),
                         ..Default::default()
                     })
                     .await
@@ -688,6 +822,9 @@ impl Session {
             // connections (including magnet metadata reads), regardless of any
             // per-connection PeerConnectionOptions.
             peer_opts.mse_mode = opts.mse_mode;
+            // Like MSE, Fast is a session-wide decision: every handshake we send, including
+            // magnet metadata reads, advertises it unless the session turned it off.
+            peer_opts.disable_fast_extension = opts.disable_fast_extension;
 
             async fn persistence_factory(
                 opts: &SessionOptions,
@@ -741,24 +878,14 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
-            let proxy_config = match proxy_url {
-                Some(pu) => Some(
-                    SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
-                ),
-                None => None,
-            };
-
             let client_name_and_version = opts
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
-                    let proxy = reqwest::Proxy::all(proxy_url)
-                        .context("error creating socks5 proxy for HTTP")?;
-                    crate::http_client::client_builder().proxy(proxy)
+                let builder = if let Some(proxy_config) = proxy_config.as_ref() {
+                    crate::http_client::client_builder()
+                        .proxy(crate::http_client::proxy(proxy_config)?)
                 } else {
                     #[allow(unused_mut)]
                     let mut b = crate::http_client::client_builder();
@@ -778,7 +905,7 @@ impl Session {
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
-                    socks_proxy_config: proxy_config,
+                    proxy: peer_proxy.clone(),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
@@ -809,9 +936,14 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            // UDP trackers follow the HTTP ones: always through the proxy.
+            let udp_tracker_client = UdpTrackerClient::new_with_proxy(
+                token.clone(),
+                bind_device.as_ref(),
+                proxy_config.as_ref(),
+            )
+            .await
+            .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {
@@ -827,6 +959,15 @@ impl Session {
                     .ok()
                 }
             };
+
+            let port_mapper = listen_result.as_mut().and_then(|listen| {
+                Self::make_port_mapper(
+                    listen,
+                    dht.as_ref(),
+                    &client_name_and_version,
+                    bind_device.clone(),
+                )
+            });
 
             let session = Arc::new(Self {
                 persistence,
@@ -846,7 +987,11 @@ impl Session {
                 reqwest_client,
                 connector: stream_connector,
                 root_span: opts.root_span,
-                stats: Arc::new(SessionStats::new()),
+                stats: {
+                    let stats = SessionStats::new();
+                    stats.peer_slots.set_limit(opts.global_peer_limit);
+                    Arc::new(stats)
+                },
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
@@ -855,6 +1000,7 @@ impl Session {
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
+                tracker_announce: opts.tracker_announce,
                 peer_limit: opts.peer_limit,
                 upload_slots: opts.upload_slots,
                 client_name_and_version,
@@ -868,6 +1014,7 @@ impl Session {
                 peer_policy: opts.peer_policy,
                 throttled_upload: ThrottledUpload::new(),
                 lsd,
+                port_mapper,
             });
 
             if let Some(mut listen) = listen_result {
@@ -901,15 +1048,20 @@ impl Session {
                         },
                     );
                 }
-                if listen.enable_upnp_port_forwarding
-                    && let Some(announce_port) = listen.announce_port
-                {
-                    info!(port = announce_port, "starting UPnP port forwarder");
-                    let bind_device = bind_device.clone();
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
-                        "upnp_forward",
-                        Self::task_upnp_port_forwarder(announce_port, bind_device),
+                if let Some(pm) = session.port_mapper.as_ref() {
+                    let mapper = pm.mapper.clone();
+                    let stopped = pm.stopped.clone();
+                    let shutdown = session.cancellation_token.clone().cancelled_owned();
+                    // Not `session.spawn`: that drops the future on cancellation, and the mapper
+                    // needs to run after it to delete the mappings on the routers.
+                    librqbit_core::spawn_utils::spawn(
+                        debug_span!(parent: session.rs(), "port_mapper"),
+                        "port_mapper",
+                        async move {
+                            let _stopped = stopped.drop_guard();
+                            mapper.run(shutdown).await;
+                            Ok::<_, anyhow::Error>(())
+                        },
                     );
                 }
             }
@@ -963,7 +1115,7 @@ impl Session {
         kind: ConnectionKind,
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
-    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
+    ) -> anyhow::Result<IncomingCheck> {
         let rwtimeout = self
             .peer_opts
             .read_write_timeout
@@ -1103,7 +1255,7 @@ impl Session {
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
         read_buf: ReadBuf,
-    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
+    ) -> anyhow::Result<IncomingCheck> {
         trace!("received handshake from {addr}: {:?}", h);
 
         if h.peer_id == self.peer_id {
@@ -1124,6 +1276,15 @@ impl Session {
             .await
             .with_context(|| format!("torrent {id} is not live, ignoring connection"))?;
 
+        // Waiting here rather than in the listener loop, which hands connections over one by one.
+        let options = &live.shared.options;
+        let permits = PeerPermits::acquire_incoming(
+            &options.peer_slots,
+            &options.session_peer_slots,
+            INCOMING_SESSION_SLOT_WAIT,
+        )
+        .await;
+
         Ok((
             live,
             CheckedIncomingConnection {
@@ -1134,6 +1295,7 @@ impl Session {
                 handshake: h,
                 read_buf,
             },
+            permits,
         ))
     }
 
@@ -1172,9 +1334,9 @@ impl Session {
                         }
                     }
                 },
-                Some(Ok((live, checked))) = futs.next(), if !futs.is_empty() => {
+                Some(Ok((live, checked, permits))) = futs.next(), if !futs.is_empty() => {
                     let (addr, kind) = (checked.addr, checked.kind);
-                    if let Err(e) = live.add_incoming_peer(checked) {
+                    if let Err(e) = live.add_incoming_peer(checked, permits) {
                         warn!(?addr, ?kind, "error handing over incoming connection: {e:#}");
                     }
                 },
@@ -1183,12 +1345,50 @@ impl Session {
         }
     }
 
-    async fn task_upnp_port_forwarder(
-        port: u16,
+    /// Builds the port mapper for the ports the session listens on, if any method is enabled:
+    /// the TCP listen port, the UDP port of the same number when uTP is on, and the DHT port.
+    /// The internal port is the one we are bound to; `announce_port` is not involved.
+    fn make_port_mapper(
+        listen: &mut ListenResult,
+        dht: Option<&Dht>,
+        client_name_and_version: &str,
         bind_device: Option<BindDevice>,
-    ) -> anyhow::Result<()> {
-        let pf = librqbit_upnp::UpnpPortForwarder::new(vec![port], None, bind_device)?;
-        pf.run_forever().await
+    ) -> Option<SessionPortMapper> {
+        let methods = PortMappingMethods {
+            upnp: listen.enable_upnp_port_forwarding,
+            natpmp: listen.enable_natpmp_port_forwarding,
+        };
+        if !methods.upnp && !methods.natpmp {
+            return None;
+        }
+        let port = listen.addr.port();
+        let ports = [
+            listen
+                .tcp_socket
+                .is_some()
+                .then_some((PortMappingProtocol::Tcp, port)),
+            listen
+                .utp_socket
+                .is_some()
+                .then_some((PortMappingProtocol::Udp, port)),
+            // Behind a proxy the DHT has no port of its own to map.
+            dht.filter(|dht| dht.proxy().is_none())
+                .map(|dht| (PortMappingProtocol::Udp, dht.listen_addr().port())),
+        ];
+        let opts = listen
+            .port_mapping
+            .take()
+            .unwrap_or_else(|| PortMappingOptions {
+                description: client_name_and_version.to_owned(),
+                ..Default::default()
+            });
+        info!(?ports, ?methods, "starting port mapper");
+        let stop_timeout = opts.shutdown_timeout.saturating_add(Duration::from_secs(1));
+        Some(SessionPortMapper {
+            mapper: PortMapper::new(ports.into_iter().flatten(), methods, opts, bind_device),
+            stopped: CancellationToken::new(),
+            stop_timeout,
+        })
     }
 
     pub fn get_dht(&self) -> Option<&Dht> {
@@ -1214,6 +1414,7 @@ impl Session {
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
+            disable_fast_extension: self.peer_opts.disable_fast_extension,
         }
     }
 
@@ -1233,6 +1434,9 @@ impl Session {
     }
 
     /// Stop the session and all managed tasks.
+    ///
+    /// Torrents are paused first. Their fast-resume bitfields are written to storage before
+    /// this returns, unless storage takes longer than ten seconds.
     pub async fn stop(&self) {
         let torrents = self
             .db
@@ -1241,15 +1445,70 @@ impl Session {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for torrent in torrents {
+        let mut stopped = Vec::with_capacity(torrents.len());
+        for torrent in &torrents {
+            for trackers in torrent.shared().all_tracker_comms() {
+                trackers.stop();
+                stopped.push(trackers.wait_stopped());
+            }
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
             }
         }
+        // The `stopped` announces need the session alive (the UDP tracker client stops with
+        // it), so they are given their time first. Each is bounded by itself; this bound is
+        // only a backstop.
+        if tokio::time::timeout(
+            TrackerTimings::default().stopped_timeout,
+            futures::future::join_all(stopped),
+        )
+        .await
+        .is_err()
+        {
+            debug!("not all stopped announces are done, stopping anyway");
+        }
         self.cancellation_token.cancel();
+
+        // Bitfield writes run on a background task each; the runtime may go away right after
+        // this returns, taking queued writes with it.
+        let flushed = futures::future::join_all(torrents.iter().map(|t| {
+            let id = t.id();
+            t.wait_bitfield_flushed().map(move |r| (id, r))
+        }));
+        match tokio::time::timeout(Self::STOP_FLUSH_TIMEOUT, flushed).await {
+            Ok(results) => {
+                for (id, r) in results {
+                    if let Err(e) = r {
+                        warn!(id, "error writing fast-resume bitfield: {e:#}");
+                    }
+                }
+            }
+            Err(_) => warn!(
+                timeout = ?Self::STOP_FLUSH_TIMEOUT,
+                "gave up waiting for fast-resume bitfields to be written"
+            ),
+        }
+
+        // The port mapper deletes the mappings on the routers; wait for it, bounded.
+        let port_mapper_stopped = async {
+            if let Some(pm) = self.port_mapper.as_ref()
+                && tokio::time::timeout(pm.stop_timeout, pm.stopped.cancelled())
+                    .await
+                    .is_err()
+            {
+                warn!("port mapper did not stop in {:?}", pm.stop_timeout);
+            }
+        };
         // this sucks, but hopefully will be enough
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        futures::future::join(
+            tokio::time::sleep(Duration::from_secs(1)),
+            port_mapper_stopped,
+        )
+        .await;
     }
+
+    /// How long [`Session::stop`] waits for fast-resume bitfields to reach storage.
+    const STOP_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Run a callback given the currently managed torrents.
     pub fn with_torrents<R>(
@@ -1287,10 +1546,12 @@ impl Session {
                     InternalAddResult {
                         info_hash,
                         info_hash_v2: None,
-                        trackers: magnet
+                        tiers: magnet
                             .trackers
                             .into_iter()
+                            .chain(opts.trackers.clone().unwrap_or_default())
                             .filter_map(|t| url::Url::parse(&t).ok())
+                            .map(|t| vec![t])
                             .collect(),
                         metadata: None,
                         name: magnet.name,
@@ -1314,20 +1575,30 @@ impl Session {
                         }
                     };
 
-                    let mut trackers = torrent
+                    let mut tiers = torrent
                         .meta
-                        .iter_announce()
-                        .unique()
-                        .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
-                            Ok(url) => Some(url.to_owned()),
-                            Err(_) => {
-                                warn!("cannot parse tracker url as utf-8, ignoring");
-                                None
-                            }
+                        .announce_tiers()
+                        .into_iter()
+                        .map(|tier| {
+                            tier.into_iter()
+                                .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
+                                    Ok(url) => url::Url::parse(url).ok(),
+                                    Err(_) => {
+                                        warn!("cannot parse tracker url as utf-8, ignoring");
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
                         })
                         .collect::<Vec<_>>();
+                    // The trackers the caller adds are tiers of their own, after the torrent's.
                     if let Some(custom_trackers) = opts.trackers.clone() {
-                        trackers.extend(custom_trackers);
+                        tiers.extend(
+                            custom_trackers
+                                .iter()
+                                .filter_map(|t| url::Url::parse(t).ok())
+                                .map(|t| vec![t]),
+                        );
                     }
 
                     InternalAddResult {
@@ -1338,10 +1609,7 @@ impl Session {
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
-                        trackers: trackers
-                            .iter()
-                            .filter_map(|t| url::Url::parse(t).ok())
-                            .collect(),
+                        tiers,
                         name: None,
                     }
                 }
@@ -1405,20 +1673,49 @@ impl Session {
             info_hash,
             info_hash_v2,
             metadata,
-            trackers,
+            tiers,
             name,
         } = add_res;
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
         let announce = !opts.paused && !opts.list_only;
 
+        // A torrent that is managed already is not looked for a second time: the trackers
+        // can't tell a second instance from the running one, so its announces (and above all
+        // its `stopped`) would count for the running torrent.
+        let already_managed = self.db.read().torrents.iter().find_map(|(eid, t)| {
+            t.shared()
+                .is_same_torrent(info_hash, info_hash_v2)
+                .then(|| (*eid, t.clone()))
+        });
+        if let Some((id, handle)) = &already_managed
+            && !opts.list_only
+        {
+            return Ok(AddTorrentResponse::AlreadyManaged(*id, handle.clone()));
+        }
+
+        // A hybrid torrent is announced under its truncated v2 hash too, by trackers of its
+        // own: an instance of `TorrentTrackers` speaks for exactly one info hash.
+        let mut alt_tracker_comms = alt_info_hash(info_hash, info_hash_v2).map(|alt| {
+            (
+                alt,
+                self.new_torrent_trackers(alt, tiers.clone(), private, opts.force_tracker_interval),
+            )
+        });
+        let tracker_comms =
+            self.new_torrent_trackers(info_hash, tiers, private, opts.force_tracker_interval);
+        if already_managed.is_some() {
+            tracker_comms.suppress_stopped();
+            if let Some((_, alt)) = &alt_tracker_comms {
+                alt.suppress_stopped();
+            }
+        }
         let make_peer_rx = || {
             self.make_peer_rx(
                 info_hash,
-                alt_info_hash(info_hash, info_hash_v2),
-                trackers.clone(),
+                &tracker_comms,
+                alt_tracker_comms.as_ref().map(|(h, t)| (*h, t)),
                 announce,
-                opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
             )
@@ -1442,8 +1739,18 @@ impl Session {
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
                     magnet_peer_opts.mse_mode = self.mse_mode;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts))
+                        .resolve_magnet(
+                            info_hash,
+                            peer_rx,
+                            &tracker_comms.own_tiers(),
+                            Some(magnet_peer_opts),
+                        )
                         .await?;
+                    // Session trackers were added when it was not known yet that the torrent
+                    // is private (BEP 27): they go now.
+                    if resolved_magnet.metadata.info.info().private {
+                        tracker_comms.drop_session_tiers();
+                    }
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
@@ -1457,17 +1764,21 @@ impl Session {
                     // too.
                     let resolved_v2 = info_hash_v2.or(resolved_magnet.info_hash_v2);
                     let is_private = resolved_magnet.metadata.info.info().private;
-                    if info_hash_v2.is_none()
+                    if alt_tracker_comms.is_none()
                         && let Some(alt) = alt_info_hash(info_hash, resolved_v2)
-                        && let Some(alt_rx) = self.swarm_peer_rx(
-                            alt,
-                            self.announce_trackers(alt, trackers.clone(), is_private),
-                            announce,
-                            opts.force_tracker_interval,
-                            is_private,
-                        )
                     {
-                        peer_rx = merge_streams(peer_rx, alt_rx).boxed();
+                        let alt_trackers = self.new_torrent_trackers(
+                            alt,
+                            tracker_comms.own_tiers(),
+                            is_private,
+                            opts.force_tracker_interval,
+                        );
+                        if let Some(alt_rx) =
+                            self.swarm_peer_rx(alt, &alt_trackers, announce, is_private)
+                        {
+                            peer_rx = merge_streams(peer_rx, alt_rx).boxed();
+                        }
+                        alt_tracker_comms = Some((alt, alt_trackers));
                     }
                     (resolved_magnet.metadata, resolved_v2, Some(peer_rx))
                 }
@@ -1507,6 +1818,28 @@ impl Session {
             }));
         }
 
+        let priorities = if opts.preferred_id.is_some() {
+            // Restoring from the session store. Its priorities were valid when written, so a
+            // bad value means a damaged or hand-edited store: keep what still fits rather than
+            // lose the torrent.
+            Priorities::from_options_lossy(
+                &metadata.file_infos,
+                metadata.lengths().total_pieces(),
+                only_files.as_deref(),
+                opts.file_priorities.as_deref(),
+                opts.piece_priorities.as_deref(),
+            )
+        } else {
+            Priorities::from_options(
+                &metadata.file_infos,
+                metadata.lengths().total_pieces(),
+                only_files.as_deref(),
+                opts.file_priorities.as_deref(),
+                opts.piece_priorities.as_deref(),
+            )
+            .context("invalid priorities")?
+        };
+
         let storage_factory = opts
             .storage_factory
             .take()
@@ -1535,6 +1868,11 @@ impl Session {
                     None
                 }
             }) {
+                // Added meanwhile: this instance did look for peers, see above.
+                tracker_comms.suppress_stopped();
+                if let Some((_, alt)) = &alt_tracker_comms {
+                    alt.suppress_stopped();
+                }
                 return Ok(AddTorrentResponse::AlreadyManaged(id, handle));
             }
             if let Some(existing) = g.torrents.get(&id) {
@@ -1547,17 +1885,19 @@ impl Session {
             let span = debug_span!(parent: self.rs(), "torrent", id);
             let peer_opts = self.merge_peer_opts(opts.peer_opts);
             let metadata = Arc::new(metadata);
+            let default_peer_limit = self.peer_limit.unwrap_or(DEFAULT_PEER_LIMIT);
             let minfo = Arc::new(ManagedTorrentShared {
                 id,
                 span,
                 info_hash,
                 info_hash_v2,
-                trackers: trackers.into_iter().collect(),
+                trackers: tracker_comms.own_tiers().into_iter().flatten().collect(),
+                tracker_comms: tracker_comms.clone(),
+                alt_tracker_comms: alt_tracker_comms.map(|(_, t)| t),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
                 storage_factory,
                 options: ManagedTorrentOptions {
-                    force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_handshake_timeout: peer_opts.handshake_timeout,
@@ -1565,11 +1905,16 @@ impl Session {
                     connect_rate: peer_opts.connect_rate,
                     peer_backoff: self.peer_backoff.clone(),
                     peer_max_request_window: peer_opts.max_request_window,
+                    disable_fast_extension: peer_opts.disable_fast_extension,
                     allow_overwrite: opts.overwrite,
-                    output_folder,
-                    ratelimits: opts.ratelimits,
+                    ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
-                    peer_limit: opts.peer_limit.or(self.peer_limit),
+                    peer_limit: Mutex::new(opts.peer_limit),
+                    default_peer_limit,
+                    peer_slots: ConnectionLimit::new(Some(
+                        opts.peer_limit.unwrap_or(default_peer_limit),
+                    )),
+                    session_peer_slots: self.stats.peer_slots.clone(),
                     peer_policy: self.peer_policy.clone(),
                     upload_slots: self.upload_slots,
                     #[cfg(feature = "disable-upload")]
@@ -1579,26 +1924,40 @@ impl Session {
                 session: Arc::downgrade(self),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
+                location: RwLock::new(StorageLocation {
+                    output_folder,
+                    renamed_files: crate::torrent_state::validate_renames(
+                        &metadata,
+                        &opts.renamed_files,
+                    )
+                    .context("invalid renamed_files")?,
+                }),
             });
 
-            let initializing = Arc::new(TorrentStateInitializing::new(
-                minfo.clone(),
-                metadata.clone(),
-                only_files.clone(),
-                self.spawner
-                    .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
-                false,
-            ));
+            let initializing = Arc::new(
+                TorrentStateInitializing::new(
+                    minfo.clone(),
+                    metadata.clone(),
+                    priorities.clone(),
+                    self.spawner.block_in_place(|| {
+                        minfo.storage_factory.create_and_init(&minfo, &metadata)
+                    })?,
+                    false,
+                )
+                .with_skip_check(opts.skip_initial_check),
+            );
             let handle = Arc::new(ManagedTorrent {
                 locked: RwLock::new(ManagedTorrentLocked {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
-                    only_files,
+                    priorities,
                     piece_picking: opts.piece_picking,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
                 metadata: ArcSwapOption::new(Some(metadata.clone())),
+                storage_op: Default::default(),
+                storage_op_cancel: self.cancellation_token.child_token(),
             });
 
             g.add_torrent(handle.clone(), id);
@@ -1655,12 +2014,24 @@ impl Session {
                 })
                 .context("no such torrent in db")?,
         };
+        // Tell the trackers while the numbers are still the torrent's own.
+        let to_stop = self.db.read().torrents.get(&id).cloned();
+        if let Some(t) = to_stop {
+            for trackers in t.shared().all_tracker_comms() {
+                trackers.stop();
+            }
+        }
         let removed = self
             .db
             .write()
             .torrents
             .remove(&id)
             .with_context(|| format!("torrent with id {id} did not exist"))?;
+
+        // A storage operation in progress (move, rename, recheck) gives up and undoes its
+        // work; wait for that, so that the files are where the torrent says they are.
+        removed.storage_op_cancel.cancel();
+        let _storage_op = removed.storage_op.lock().await;
 
         if let Err(e) = removed.pause() {
             debug!("error pausing torrent before deletion: {e:#}")
@@ -1706,15 +2077,12 @@ impl Session {
             (Err(e), true) => return Err(e).context("torrent deleted, but could not delete files"),
             (Ok(storage), true) => {
                 debug!("will delete files");
-                remove_files_and_dirs(&metadata.file_infos, &storage);
-                if removed.shared().options.output_folder != self.output_folder
+                remove_files_and_dirs(removed.shared(), &metadata, &storage);
+                let output_folder = removed.output_folder();
+                if output_folder != self.output_folder
                     && let Err(e) = storage.remove_directory_if_empty(Path::new(""))
                 {
-                    warn!(
-                        ?id,
-                        "error removing {:?}: {e:#}",
-                        removed.shared().options.output_folder
-                    )
+                    warn!(?id, "error removing {output_folder:?}: {e:#}")
                 }
             }
             (_, false) => {
@@ -1732,49 +2100,73 @@ impl Session {
         announce: bool,
     ) -> Option<PeerStream> {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
+        let shared = t.shared();
+        let alt = shared
+            .alt_info_hash()
+            .zip(shared.alt_tracker_comms.as_ref());
         self.make_peer_rx(
             t.info_hash(),
-            t.shared().alt_info_hash(),
-            t.shared().trackers.iter().cloned().collect(),
+            &shared.tracker_comms,
+            alt,
             announce,
-            t.shared().options.force_tracker_interval,
-            t.shared().options.initial_peers.clone(),
+            shared.options.initial_peers.clone(),
             is_private,
         )
     }
 
+    /// Builds what talks to the trackers of one torrent: the torrent's own tiers, then every
+    /// tracker of the session as a tier of its own (never for private torrents).
+    fn new_torrent_trackers(
+        self: &Arc<Self>,
+        info_hash: Id20,
+        mut tiers: Vec<Vec<url::Url>>,
+        is_private: bool,
+        force_interval: Option<Duration>,
+    ) -> Arc<TorrentTrackers> {
+        let own_tiers = tiers.len();
+        if !is_private {
+            let mut session_trackers: Vec<_> = self.trackers.iter().cloned().collect();
+            session_trackers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            tiers.extend(session_trackers.into_iter().map(|t| vec![t]));
+        }
+        TorrentTrackers::new(
+            TrackerCommsParams {
+                info_hash,
+                peer_id: self.peer_id,
+                stats: Box::new(PeerRxTorrentInfo {
+                    info_hash,
+                    session: Arc::downgrade(self),
+                }),
+                force_interval,
+                announce_port: self.announce_port().unwrap_or(4240),
+                reqwest_client: self.reqwest_client.clone(),
+                udp_client: self.udp_tracker_client.clone(),
+                options: self.tracker_announce,
+                timings: TrackerTimings::default(),
+                enabled: !self.disable_trackers,
+            },
+            tiers,
+            own_tiers,
+            true,
+        )
+    }
+
     // Get a peer stream from both DHT and trackers. A hybrid torrent lives in two swarms, so
-    // it is announced and looked up under both `info_hash` and `alt_info_hash` (its truncated
-    // v2 hash), and the peers of both feed the same stream.
-    #[allow(clippy::too_many_arguments)]
+    // it is announced and looked up under both `info_hash` and its truncated v2 hash (`alt`,
+    // with the trackers that announce that hash), and the peers of both feed the same stream.
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
-        alt_info_hash: Option<Id20>,
-        trackers: Vec<url::Url>,
+        trackers: &Arc<TorrentTrackers>,
+        alt: Option<(Id20, &Arc<TorrentTrackers>)>,
         announce: bool,
-        force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
-        let trackers = self.announce_trackers(info_hash, trackers, is_private);
-
-        let alt_rx = alt_info_hash.and_then(|alt| {
-            self.swarm_peer_rx(
-                alt,
-                trackers.clone(),
-                announce,
-                force_tracker_interval,
-                is_private,
-            )
+        let alt_rx = alt.and_then(|(alt_hash, alt_trackers)| {
+            self.swarm_peer_rx(alt_hash, alt_trackers, announce, is_private)
         });
-        let main_rx = self.swarm_peer_rx(
-            info_hash,
-            trackers,
-            announce,
-            force_tracker_interval,
-            is_private,
-        );
+        let main_rx = self.swarm_peer_rx(info_hash, trackers, announce, is_private);
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1787,36 +2179,12 @@ impl Session {
         )
     }
 
-    // The trackers a torrent announces to: its own, then the session-wide ones.
-    fn announce_trackers(
-        &self,
-        info_hash: Id20,
-        mut trackers: Vec<url::Url>,
-        is_private: bool,
-    ) -> Vec<url::Url> {
-        if self.disable_trackers {
-            trackers.clear();
-        }
-
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
-        } else if !self.disable_trackers {
-            trackers.extend(self.trackers.iter().cloned());
-        }
-        trackers
-    }
-
     // The peers of one swarm: DHT, trackers and local service discovery for `info_hash`.
     fn swarm_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
-        trackers: Vec<url::Url>,
+        trackers: &Arc<TorrentTrackers>,
         announce: bool,
-        force_tracker_interval: Option<Duration>,
         is_private: bool,
     ) -> Option<PeerStream> {
         let dht_rx = if is_private {
@@ -1835,20 +2203,7 @@ impl Session {
             })
         };
 
-        let tracker_rx_stats = PeerRxTorrentInfo {
-            info_hash,
-            session: self.clone(),
-        };
-        let tracker_rx = TrackerComms::start(
-            info_hash,
-            self.peer_id,
-            trackers.into_iter().collect(),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
-            self.reqwest_client.clone(),
-            self.udp_tracker_client.clone(),
-        );
+        let tracker_rx = trackers.peer_stream();
 
         merge_two_optional_streams(merge_two_optional_streams(dht_rx, tracker_rx), lsd_rx)
     }
@@ -1862,15 +2217,223 @@ impl Session {
     }
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        // Wait for a storage operation to finish instead of changing the state under it.
+        let _storage_op = handle.lock_storage_op().await?;
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.stop();
+        }
         handle.pause()?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
 
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        let _storage_op = handle.lock_storage_op().await?;
         let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
         handle.start(peer_rx, false)?;
         self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    // Starts a torrent that a storage operation stopped (`restart`) the way the user left it:
+    // running if it was running, paused (after its check) if it was paused.
+    fn resume_after_storage_op(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        restart: bool,
+    ) -> anyhow::Result<()> {
+        // A deleted torrent stays stopped.
+        if !restart || handle.is_storage_op_cancelled() {
+            return Ok(());
+        }
+        let paused = handle.is_paused();
+        let peer_rx = if paused {
+            None
+        } else {
+            self.make_peer_rx_managed_torrent(handle, true)
+        };
+        handle.start(peer_rx, paused)
+    }
+
+    /// Forgets which pieces the torrent has (the fastresume bitfield included) and verifies
+    /// every piece of the selected files against the data in its storage, like the initial
+    /// check of a torrent added without fastresume data.
+    ///
+    /// Works in every state. During the check the torrent is initializing, with the progress
+    /// in its stats, and does no transfers; a pause during the check is honored the way it is
+    /// during the initial check. Afterwards the torrent returns to the state it was in: a
+    /// running torrent downloads what turned out missing or seeds, a paused one stays paused,
+    /// one in error leaves the error if the check succeeds. The upload and download counters
+    /// are kept.
+    ///
+    /// Returns once the check is underway; [`ManagedTorrent::wait_until_initialized`] waits
+    /// for its end. Waits for a storage operation already running on the torrent.
+    pub async fn force_recheck(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+    ) -> anyhow::Result<()> {
+        let _storage_op = handle.lock_storage_op().await?;
+        handle.quiesce().await?;
+        handle.begin_recheck()?;
+        self.resume_after_storage_op(handle, true)
+    }
+
+    /// Moves the files of the torrent under `new_output_folder`, keeping their paths
+    /// relative to the output folder, and stores them there from then on. Only the files
+    /// that exist move (padding files never do, unselected files that were never created
+    /// don't); directories left empty at the old place are removed, nothing else is.
+    ///
+    /// Works in every state. The torrent stops its transfers (or its check) during the move
+    /// and returns to the state it was in afterwards, without hashing anything, unless
+    /// [`MoveStorageMode::KeepExisting`] adopted a file that was at the destination: then
+    /// the torrent is rechecked as by [`Self::force_recheck`]. A file is renamed when
+    /// possible and otherwise copied, flushed, checked and removed (across filesystems).
+    ///
+    /// If anything fails, what was moved is moved back and the torrent keeps working at the
+    /// old place; the error says what went wrong (and which files the undo couldn't put back,
+    /// if any). Moving to the current folder does nothing. Waits for a storage operation
+    /// already running on the torrent; deleting the torrent or stopping the session during
+    /// the move undoes it.
+    ///
+    /// The storage must support it ([`crate::storage::TorrentStorage::move_storage`]).
+    pub async fn move_storage(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        new_output_folder: PathBuf,
+        mode: MoveStorageMode,
+    ) -> anyhow::Result<()> {
+        if new_output_folder.as_os_str().is_empty() {
+            bail!("the new output folder is empty");
+        }
+        let metadata = handle
+            .metadata
+            .load_full()
+            .context("torrent is not resolved")?;
+        let _storage_op = handle.lock_storage_op().await?;
+        if new_output_folder == handle.output_folder() {
+            return Ok(());
+        }
+        let files = metadata
+            .file_infos
+            .iter()
+            .enumerate()
+            .map(|(idx, fi)| {
+                if fi.attrs.padding {
+                    None
+                } else {
+                    handle.shared.file_relative_path(&metadata, idx)
+                }
+            })
+            .collect::<Vec<_>>();
+        let cancel = handle.storage_op_cancel.clone();
+
+        let quiesced = handle.quiesce().await?;
+        let outcome = handle
+            .with_quiesced_storage(|storage| {
+                storage.move_storage(&MoveStorageRequest {
+                    new_output_folder: &new_output_folder,
+                    files: &files,
+                    mode,
+                    cancel: &cancel,
+                })
+            })
+            .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if let Err(re) = self.resume_after_storage_op(handle, quiesced.needs_restart()) {
+                    return Err(e.context(format!("and restarting the torrent failed: {re:#}")));
+                }
+                return Err(e);
+            }
+        };
+
+        handle.shared.location.write().output_folder = new_output_folder;
+        self.try_update_persistence_metadata(handle).await;
+
+        if !outcome.adopted_files.is_empty() && !handle.is_errored() {
+            debug!(adopted = ?outcome.adopted_files, "files adopted at the destination, rechecking");
+            handle.begin_recheck()?;
+            return self.resume_after_storage_op(handle, true);
+        }
+        self.resume_after_storage_op(handle, quiesced.needs_restart())
+    }
+
+    /// Gives file `file_index` of the torrent another path, relative to the output folder,
+    /// and moves it there if it exists (creating directories; directories left empty are
+    /// removed). [`ManagedTorrent::file_path`] gives the path a file has now; the metadata
+    /// keeps the published one.
+    ///
+    /// The path must be relative, without `..`, and must not collide, ignoring case, with
+    /// the path of another file of the torrent or a directory holding one. Padding files
+    /// can't be renamed. Works in every state; the torrent stops its transfers during the
+    /// rename and returns to its state afterwards. The new path is persisted with the
+    /// torrent; an embedder without session persistence gives it back with
+    /// [`AddTorrentOptions::renamed_files`]. Waits for a storage operation already running
+    /// on the torrent.
+    ///
+    /// The storage must support it ([`crate::storage::TorrentStorage::rename_file`]).
+    pub async fn rename_file(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        file_index: usize,
+        new_relative_path: PathBuf,
+    ) -> anyhow::Result<()> {
+        let metadata = handle
+            .metadata
+            .load_full()
+            .context("torrent is not resolved")?;
+        let _storage_op = handle.lock_storage_op().await?;
+        let mut renamed = handle.shared.renamed_files();
+        renamed.insert(file_index, new_relative_path.clone());
+        let renamed = crate::torrent_state::validate_renames(&metadata, &renamed)?;
+        let from = handle
+            .shared
+            .file_relative_path(&metadata, file_index)
+            .context("no such file")?;
+        if from == new_relative_path {
+            return Ok(());
+        }
+
+        let quiesced = handle.quiesce().await?;
+        let result = handle
+            .with_quiesced_storage(|storage| {
+                storage.rename_file(file_index, &from, &new_relative_path)
+            })
+            .await;
+        if result.is_ok() {
+            handle.shared.location.write().renamed_files = renamed;
+            self.try_update_persistence_metadata(handle).await;
+        }
+        let resumed = self.resume_after_storage_op(handle, quiesced.needs_restart());
+        match (result, resumed) {
+            (Err(e), Err(re)) => {
+                Err(e.context(format!("and restarting the torrent failed: {re:#}")))
+            }
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Announces to the trackers of the torrent that are in use right now, without waiting for
+    /// the interval. A tracker is never asked more often than once every 10 seconds, however
+    /// often this is called. Fails when the torrent is not running (paused or still checking
+    /// its files), as it is not announcing then.
+    pub fn reannounce(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.reannounce()?;
+        }
+        Ok(())
+    }
+
+    /// Asks the trackers of the torrent that are in use right now how many seeders and
+    /// leechers they know of (BEP 48 / BEP 15 scrape). The answers show up in
+    /// [`ManagedTorrent::trackers`] shortly after. A tracker is never asked more often than
+    /// once every 10 seconds. Fails when the torrent is not running.
+    pub fn scrape(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.scrape()?;
+        }
         Ok(())
     }
 
@@ -1880,6 +2443,33 @@ impl Session {
         only_files: &HashSet<usize>,
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Sets the download priority of some files, `(file index, level)`, in any state: 0 is not
+    /// downloaded, 1 normal, 6 high, 7 maximum (see [`crate::Priority`]). A live torrent asks
+    /// for the new order from its next request on, and cancels the requests of pieces no file
+    /// wants any more. An unknown file index or a level above 7 is an error and changes nothing.
+    pub async fn set_file_priorities(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        priorities: &[(usize, u8)],
+    ) -> anyhow::Result<()> {
+        handle.set_file_priorities(priorities)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Sets (`Some(level)`) or clears (`None`) an explicit priority of single pieces, `(piece
+    /// index, level)`, in any state. The explicit level wins over the one the piece gets from its
+    /// files. An unknown piece index or a level above 7 is an error and changes nothing.
+    pub async fn set_piece_priorities(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        priorities: &[(u32, Option<u8>)],
+    ) -> anyhow::Result<()> {
+        handle.set_piece_priorities(priorities)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
@@ -1894,12 +2484,75 @@ impl Session {
         self.try_update_persistence_metadata(handle).await;
     }
 
+    /// Change a torrent's own upload and download rate limits (`None`: unlimited), in any state.
+    /// A live torrent applies them at once, also to the transfers already waiting for the old
+    /// rate. They are kept across pause / resume and persisted. The session limits
+    /// ([`Session::ratelimits`]) keep applying on top of them.
+    pub async fn set_torrent_ratelimits(
+        &self,
+        handle: &ManagedTorrentHandle,
+        limits: LimitsConfig,
+    ) -> anyhow::Result<()> {
+        handle.set_ratelimits(limits);
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Change a torrent's own limit on connecting + connected peers (`None`: the session's
+    /// default, [`SessionOptions::peer_limit`]), in any state. It is kept across pause / resume
+    /// and persisted; the session-wide limit applies on top of it.
+    ///
+    /// Raising it lets the torrent connect to more peers at once. Lowering it below the number
+    /// of peers the torrent has disconnects nobody: no new connection is made (incoming ones are
+    /// refused) until enough of the existing ones have ended.
+    pub async fn set_torrent_peer_limit(
+        &self,
+        handle: &ManagedTorrentHandle,
+        limit: Option<usize>,
+    ) -> anyhow::Result<()> {
+        handle.set_peer_limit(limit);
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// The limit on connecting + connected peers over all torrents of the session. `None`: no
+    /// session-wide limit.
+    pub fn global_peer_limit(&self) -> Option<usize> {
+        self.stats.peer_slots.limit()
+    }
+
+    /// Change the limit on connecting + connected peers over all torrents of the session
+    /// (`None`: no session-wide limit). Each torrent's own limit keeps applying.
+    ///
+    /// Raising it lets the waiting torrents connect at once. Lowering it below the number of
+    /// peers the session has disconnects nobody: no new connection is made (incoming ones are
+    /// refused) until enough of the existing ones have ended.
+    pub fn set_global_peer_limit(&self, limit: Option<usize>) {
+        self.stats.peer_slots.set_limit(limit);
+    }
+
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.listen_addr
     }
 
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port
+    }
+
+    /// Where the router port mappings of the session stand: one row per `(protocol, internal
+    /// port)` among the TCP listen port, the uTP UDP port and the DHT UDP port, sorted by protocol
+    /// then port. Empty when port mapping is off (see
+    /// [`ListenerOptions::enable_upnp_port_forwarding`](crate::ListenerOptions) and
+    /// `enable_natpmp_port_forwarding`).
+    ///
+    /// When several methods mapped a port, the row reports the first of UPnP, PCP, NAT-PMP.
+    /// The external port may differ from the internal one when the router picked another;
+    /// [`Session::announce_port`] still announces the internal one.
+    pub fn port_mappings(&self) -> Vec<PortMappingStatus> {
+        self.port_mapper
+            .as_ref()
+            .map(|pm| pm.mapper.status())
+            .unwrap_or_default()
     }
 
     /// Closes the live connections to every peer whose address satisfies `f` (IPv4-mapped IPv6
@@ -1958,7 +2611,7 @@ impl Session {
         self: &Arc<Self>,
         info_hash: Id20,
         peer_rx: PeerStream,
-        trackers: &[url::Url],
+        tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
@@ -1970,6 +2623,7 @@ impl Session {
             self.connector.clone(),
             self.client_name_and_version.clone(),
             self.outgoing_admit(),
+            self.stats.peer_slots.clone(),
         )
         .await
         {
@@ -1985,7 +2639,7 @@ impl Session {
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
                         info,
-                        torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
+                        torrent_file_from_info_bytes(info_bytes.as_ref(), tiers)?,
                         info_bytes.0,
                     )?,
                     info_hash_v2,
@@ -2055,21 +2709,30 @@ pub(crate) struct ResolveMagnetResult {
     pub seen_peers: Vec<SocketAddr>,
 }
 
-fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
+// Removes the files of a torrent at the paths they are stored under now (renames included),
+// then the directories that became empty.
+fn remove_files_and_dirs(
+    shared: &ManagedTorrentShared,
+    metadata: &TorrentMetadata,
+    files: &dyn TorrentStorage,
+) {
     let mut all_dirs = HashSet::new();
-    for (id, fi) in infos.iter().enumerate() {
+    for (id, fi) in metadata.file_infos.iter().enumerate() {
         if fi.attrs.padding {
             continue;
         }
-        let mut fname = &*fi.relative_filename;
-        if let Err(e) = files.remove_file(id, fname) {
-            warn!(?fi.relative_filename, error=?e, "could not delete file");
+        let Some(path) = shared.file_relative_path(metadata, id) else {
+            continue;
+        };
+        if let Err(e) = files.remove_file(id, &path) {
+            warn!(?path, error=?e, "could not delete file");
         } else {
-            debug!(?fi.relative_filename, "deleted the file")
+            debug!(?path, "deleted the file")
         }
+        let mut fname = path.as_path();
         while let Some(parent) = fname.parent() {
             if parent != Path::new("") {
-                all_dirs.insert(parent);
+                all_dirs.insert(parent.to_owned());
             }
             fname = parent;
         }
@@ -2081,7 +2744,7 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
         v
     };
     for dir in all_dirs {
-        if let Err(e) = files.remove_directory_if_empty(dir) {
+        if let Err(e) = files.remove_directory_if_empty(&dir) {
             warn!("error removing {dir:?}: {e:#}");
         } else {
             debug!("removed {dir:?}")
@@ -2092,12 +2755,15 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hash: Id20,
-    session: Arc<Session>,
+    session: std::sync::Weak<Session>,
 }
 
 impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
     fn get(&self) -> tracker_comms::TrackerCommsStats {
-        let mt = self.session.with_torrents(|torrents| {
+        let Some(session) = self.session.upgrade() else {
+            return Default::default();
+        };
+        let mt = session.with_torrents(|torrents| {
             for (_, mt) in torrents {
                 if mt.shared().has_info_hash(self.info_hash) {
                     return Some(mt.clone());
@@ -2170,8 +2836,11 @@ mod tests {
         let parsed = torrent_from_bytes(&orig_full_torrent[..]).unwrap();
         let parsed_trackers = get_trackers(&parsed);
 
-        let generated_torrent =
-            torrent_file_from_info_bytes(parsed.info.raw_bytes.as_ref(), &parsed_trackers).unwrap();
+        let generated_torrent = torrent_file_from_info_bytes(
+            parsed.info.raw_bytes.as_ref(),
+            std::slice::from_ref(&parsed_trackers),
+        )
+        .unwrap();
         let generated_parsed = torrent_from_bytes(generated_torrent.as_ref()).unwrap();
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);

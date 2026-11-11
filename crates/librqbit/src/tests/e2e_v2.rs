@@ -520,11 +520,18 @@ async fn test_e2e_v2_corrupted_block_is_redownloaded() -> anyhow::Result<()> {
                         .get(begin as usize..(begin + len) as usize)
                         .with_context(|| format!("request {index}/{begin}/{len} past the piece"))?
                         .to_vec();
-                    if corrupted.is_none() {
+                    let corrupt = corrupted.is_none();
+                    if corrupt {
                         data[0] ^= 1;
                         corrupted = Some(index);
                     }
-                    peer.piece(index, begin, &data).await?;
+                    match peer.piece(index, begin, &data).await {
+                        Ok(()) => {}
+                        // The client hangs up as soon as it has checked the corrupted piece,
+                        // so answers to the requests it sent before may hit a closed socket.
+                        Err(_) if !corrupt => break,
+                        Err(e) => return Err(e),
+                    }
                 }
                 Recv::Msg(_) => {}
                 Recv::Closed => break,

@@ -154,6 +154,11 @@ struct Opts {
     #[arg(long = "peer-limit", env = "RQBIT_PEER_LIMIT")]
     peer_limit: Option<usize>,
 
+    /// The maximum number of connecting + connected peers over all torrents together, on top
+    /// of each torrent's own limit. Unlimited if not set.
+    #[arg(long = "global-peer-limit", env = "RQBIT_GLOBAL_PEER_LIMIT")]
+    global_peer_limit: Option<usize>,
+
     /// How many peers each torrent uploads to at a time: a number, "auto" (as many as take
     /// data at a worthwhile rate, at least 4) or "unlimited" (every peer that asks).
     #[arg(long = "upload-slots", env = "RQBIT_UPLOAD_SLOTS", default_value_t)]
@@ -239,8 +244,9 @@ struct Opts {
     )]
     max_blocking_threads: u16,
 
-    /// If set will use socks5 proxy for all outgoing connections.
-    /// The format is socks5://[username:password@]host:port (socks5h:// also supported).
+    /// If set will use this proxy for all outgoing connections and tracker requests.
+    /// The format is scheme://[username:password@]host:port, the scheme being socks5, socks5h
+    /// (the proxy resolves host names), socks4, socks4a or http (CONNECT tunnels).
     ///
     /// You may also want to disable incoming connections via --disable-tcp-listen.
     #[arg(long, env = "RQBIT_SOCKS_PROXY_URL")]
@@ -300,6 +306,10 @@ struct Opts {
     /// Disable trackers (for debugging DHT, LSD and --initial-peers)
     #[arg(long = "disable-trackers", env = "RQBIT_TRACKERS_DISABLE")]
     disable_trackers: bool,
+
+    /// Disable the Fast Extension (BEP 6: HaveAll / HaveNone, rejects, allowed-fast pieces)
+    #[arg(long = "disable-fast-extension", env = "RQBIT_FAST_EXTENSION_DISABLE")]
+    disable_fast_extension: bool,
 }
 
 #[derive(Parser)]
@@ -644,6 +654,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 .map(|s| s.split(",").map(|v| v.to_string()).collect()),
             port: None,
             persistence,
+            ..Default::default()
         })
     };
 
@@ -655,6 +666,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         listen,
         connect: Some(ConnectionOptions {
             proxy_url: opts.socks_url.take(),
+            proxy_peer_connections: true,
             enable_tcp: !opts.disable_tcp_connect,
             peer_opts: Some(PeerConnectionOptions {
                 connect_timeout: Some(opts.peer_connect_timeout),
@@ -693,7 +705,9 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         disable_local_service_discovery: opts.disable_local_peer_discovery,
         disable_trackers: opts.disable_trackers,
         trackers,
+        tracker_announce: Default::default(),
         peer_limit: opts.peer_limit,
+        global_peer_limit: opts.global_peer_limit,
         upload_slots: opts.upload_slots,
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
@@ -701,6 +715,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         mse_mode: Default::default(),
         peer_backoff: None,
         peer_policy: None,
+        disable_fast_extension: opts.disable_fast_extension,
     };
 
     #[allow(clippy::needless_update)]
