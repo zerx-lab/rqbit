@@ -745,6 +745,37 @@ mod tests {
         scratch.drop_schema().await
     }
 
+    // Super seeding set at run time reaches the row through update_metadata, and a torrent
+    // stored with it is written with it.
+    #[tokio::test]
+    async fn test_super_seeding_round_trip() -> anyhow::Result<()> {
+        let Some(scratch) = Scratch::new("super_seeding").await? else {
+            return Ok(());
+        };
+        let store = scratch.store().await?;
+        let f = fixture("rqbit_pg_super_seeding").await?;
+        let id = store.next_id().await?;
+        store.store(id, &f.handle).await?;
+        assert!(!store.get(id).await?.super_seeding);
+
+        f.session.set_super_seeding(&f.handle, true).await?;
+        store.update_metadata(id, &f.handle).await?;
+        assert!(store.get(id).await?.super_seeding);
+        let id2 = store.next_id().await?;
+        store.store(id2, &f.handle).await?;
+        let all = load_all(&store).await?;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|(_, st)| st.super_seeding));
+        let (_, opts) = store.get(id2).await?.into_add_torrent()?;
+        assert!(opts.super_seeding);
+
+        f.session.set_super_seeding(&f.handle, false).await?;
+        store.update_metadata(id, &f.handle).await?;
+        assert!(!store.get(id).await?.super_seeding);
+
+        scratch.drop_schema().await
+    }
+
     // A table created before renames, limits, priorities and the move marker existed: the store
     // adds the columns and loads the old row with their defaults, and can update it.
     #[tokio::test]
@@ -798,6 +829,7 @@ mod tests {
             assert!(st.peer_limit.is_none());
             assert!(st.file_priorities.is_none());
             assert!(st.piece_priorities.is_empty());
+            assert!(!st.super_seeding);
         };
         check(&store.get(5).await?);
         let all = load_all(&store).await?;
