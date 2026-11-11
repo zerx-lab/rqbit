@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -1224,53 +1224,86 @@ impl Session {
         .boxed()
     }
 
+    /// Read the handshake of an incoming connection and find the torrent it is for.
+    ///
+    /// Only holds a [`Weak`] reference to the session while waiting on the peer: a
+    /// connection that stays silent must not keep a dropped session (and all its
+    /// tasks) alive until the handshake times out.
     async fn check_incoming_connection(
-        self: Arc<Self>,
+        session: Weak<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<IncomingCheck> {
-        let rwtimeout = self
-            .peer_opts
-            .read_write_timeout
-            .unwrap_or_else(|| Duration::from_secs(10));
-        // Separate handshake timeout for the inbound BT/MSE handshake; falls
-        // back to read_write_timeout when unset (upstream behavior).
-        let handshake_timeout = crate::i2p::peer_handshake_timeout(
-            &addr,
-            self.peer_opts.handshake_timeout.unwrap_or(rwtimeout),
-        );
-
-        let incoming_ip = addr.ip();
         // I2P peers have synthetic addresses, which are not IPs: no IP filter applies to them.
         let i2p_peer = kind == ConnectionKind::I2p;
-        if !i2p_peer && self.blocklist.has(incoming_ip) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is in blocklist");
-        }
-        if !i2p_peer && self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is not in allowlist");
-        }
-        if let Some(policy) = self.peer_policy.as_ref()
-            && !policy.admit(canonical_ip(incoming_ip))
-        {
-            self.stats
-                .counters
-                .blocked_incoming
-                .fetch_add(1, Ordering::Relaxed);
-            bail!("Incoming ip {incoming_ip} is refused by the peer policy");
-        }
+        let (handshake_timeout, mse_mode, torrent_keys) = {
+            let this = session.upgrade().context("session is dead")?;
+            let rwtimeout = this
+                .peer_opts
+                .read_write_timeout
+                .unwrap_or_else(|| Duration::from_secs(10));
+            // Separate handshake timeout for the inbound BT/MSE handshake; falls
+            // back to read_write_timeout when unset (upstream behavior).
+            let handshake_timeout = crate::i2p::peer_handshake_timeout(
+                &addr,
+                this.peer_opts.handshake_timeout.unwrap_or(rwtimeout),
+            );
+
+            let incoming_ip = addr.ip();
+            if !i2p_peer && this.blocklist.has(incoming_ip) {
+                this.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("Incoming ip {incoming_ip} is in blocklist");
+            }
+            if !i2p_peer && this.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
+                this.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("Incoming ip {incoming_ip} is not in allowlist");
+            }
+            if let Some(policy) = this.peer_policy.as_ref()
+                && !policy.admit(canonical_ip(incoming_ip))
+            {
+                this.stats
+                    .counters
+                    .blocked_incoming
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("Incoming ip {incoming_ip} is refused by the peer policy");
+            }
+
+            // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
+            // so the MSE acceptor can resolve the peer's obfuscated info hash. A hybrid
+            // torrent has two: peers of the v2 swarm use its truncated v2 hash.
+            let torrent_keys: Vec<([u8; 20], [u8; 20])> = if this.mse_mode == MseMode::Disabled
+                || i2p_peer
+            {
+                Vec::new()
+            } else {
+                this.db
+                    .read()
+                    .torrents
+                    .values()
+                    .flat_map(|torrent| {
+                        std::iter::once(torrent.info_hash()).chain(torrent.shared().alt_info_hash())
+                    })
+                    .map(|info_hash| {
+                        let mut h = Sha1::new();
+                        h.update(b"req2");
+                        h.update(&info_hash.0);
+                        (h.finish(), info_hash.0)
+                    })
+                    .collect()
+            };
+            (handshake_timeout, this.mse_mode, torrent_keys)
+        };
 
         // I2P streams are encrypted already: no MSE on them, as with libtorrent.
-        if self.mse_mode == MseMode::Disabled || i2p_peer {
+        if mse_mode == MseMode::Disabled || i2p_peer {
             debug!(?addr, "MSE disabled, skipping MSE incoming handshake");
             let mut read_buf = ReadBuf::new();
             let mut reader = reader;
@@ -1278,29 +1311,11 @@ impl Session {
                 .read_handshake(&mut reader, handshake_timeout)
                 .await
                 .context("error reading handshake")?;
-            return self
-                .finish_incoming_connection(addr, kind, h, reader, writer, read_buf)
-                .await;
+            return Self::finish_incoming_connection(
+                session, addr, kind, h, reader, writer, read_buf,
+            )
+            .await;
         }
-
-        // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
-        // so the MSE acceptor can resolve the peer's obfuscated info hash. A hybrid
-        // torrent has two: peers of the v2 swarm use its truncated v2 hash.
-        let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
-            .db
-            .read()
-            .torrents
-            .values()
-            .flat_map(|torrent| {
-                std::iter::once(torrent.info_hash()).chain(torrent.shared().alt_info_hash())
-            })
-            .map(|info_hash| {
-                let mut h = Sha1::new();
-                h.update(b"req2");
-                h.update(&info_hash.0);
-                (h.finish(), info_hash.0)
-            })
-            .collect();
 
         let lookup = |skey_hash: &[u8; 20]| -> Option<[u8; 20]> {
             torrent_keys
@@ -1326,7 +1341,8 @@ impl Session {
                 if h.info_hash.0 != info_hash {
                     bail!("MSE handshake info hash does not match SKEY");
                 }
-                self.finish_incoming_connection(
+                Self::finish_incoming_connection(
+                    session,
                     addr,
                     kind,
                     h,
@@ -1337,7 +1353,7 @@ impl Session {
                 .await
             }
             IncomingOutcome::Plaintext { read, write } => {
-                if self.mse_mode == MseMode::Forced {
+                if mse_mode == MseMode::Forced {
                     warn!(?addr, "MSE forced, rejecting plaintext connection");
                     bail!("MSE is forced, rejecting plaintext connection from {addr}");
                 }
@@ -1355,7 +1371,8 @@ impl Session {
                 let (h, _size) = Handshake::deserialize(&handshake_bytes[..]).map_err(|e| {
                     anyhow::anyhow!("error deserializing plaintext handshake: {e:?}")
                 })?;
-                self.finish_incoming_connection(
+                Self::finish_incoming_connection(
+                    session,
                     addr,
                     kind,
                     h,
@@ -1369,7 +1386,7 @@ impl Session {
     }
 
     async fn finish_incoming_connection(
-        self: Arc<Self>,
+        session: Weak<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
         h: Handshake,
@@ -1379,18 +1396,21 @@ impl Session {
     ) -> anyhow::Result<IncomingCheck> {
         trace!("received handshake from {addr}: {:?}", h);
 
-        if h.peer_id == self.peer_id {
-            bail!("seems like we are connecting to ourselves, ignoring");
-        }
+        let (id, torrent) = {
+            let this = session.upgrade().context("session is dead")?;
+            if h.peer_id == this.peer_id {
+                bail!("seems like we are connecting to ourselves, ignoring");
+            }
 
-        let (id, torrent) = self
-            .db
-            .read()
-            .torrents
-            .iter()
-            .find(|(_, t)| t.shared().has_info_hash(h.info_hash))
-            .map(|(id, t)| (*id, t.clone()))
-            .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+            let found = this
+                .db
+                .read()
+                .torrents
+                .iter()
+                .find(|(_, t)| t.shared().has_info_hash(h.info_hash))
+                .map(|(id, t)| (*id, t.clone()));
+            found.with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?
+        };
         if !torrent.shared().net.admits(&addr) {
             bail!(
                 "{addr} is from a network the torrent {:?} doesn't use",
@@ -1431,20 +1451,31 @@ impl Session {
         l: A,
         max_pending_incoming_handshake_checks: usize,
     ) -> anyhow::Result<()> {
+        // Pending checks only hold a weak reference to the session (see
+        // check_incoming_connection), so neither they nor this task keep it alive.
         let mut futs = FuturesUnordered::new();
         let session = Arc::downgrade(&self);
         drop(self);
 
+        // After an accept error, stop accepting for a while, but keep driving the
+        // pending checks meanwhile.
+        let mut accept_paused_until: Option<tokio::time::Instant> = None;
+
         loop {
+            let paused_until = accept_paused_until;
+            let can_accept =
+                paused_until.is_none() && futs.len() < max_pending_incoming_handshake_checks;
             tokio::select! {
-                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
+                r = l.accept(), if can_accept => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
-                            let session = session.upgrade().context("session is dead")?;
-                            let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
+                            let span = {
+                                let session = session.upgrade().context("session is dead")?;
+                                debug_span!(parent: session.rs(), "incoming", addr=%addr)
+                            };
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                Self::check_incoming_connection(session.clone(), addr, A::KIND, Box::new(read), Box::new(write))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -1456,10 +1487,13 @@ impl Session {
                             warn!("error accepting: {e:#}");
                             // Whatever is the reason, ensure we are not stuck trying to
                             // accept indefinitely.
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue
+                            accept_paused_until =
+                                Some(tokio::time::Instant::now() + Duration::from_secs(10));
                         }
                     }
+                },
+                _ = tokio::time::sleep_until(paused_until.unwrap_or_else(tokio::time::Instant::now)), if paused_until.is_some() => {
+                    accept_paused_until = None;
                 },
                 Some(Ok((live, checked, permits))) = futs.next(), if !futs.is_empty() => {
                     let (addr, kind) = (checked.addr, checked.kind);
