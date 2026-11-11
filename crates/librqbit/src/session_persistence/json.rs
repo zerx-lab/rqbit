@@ -166,6 +166,8 @@ impl JsonSessionPersistenceStore {
             only_files: torrent.only_files().clone(),
             is_paused: torrent.is_paused(),
             piece_picking: torrent.piece_picking(),
+            ratelimits: torrent.ratelimits(),
+            peer_limit: torrent.peer_limit(),
             output_folder: torrent.shared().options.output_folder.clone(),
         };
 

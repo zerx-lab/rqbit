@@ -13,8 +13,8 @@ use librqbit_core::magnet::Magnet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AddTorrent, AddTorrentOptions, PiecePicking, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle,
+    AddTorrent, AddTorrentOptions, PiecePicking, bitv_factory::BitVFactory, limits::LimitsConfig,
+    session::TorrentId, torrent_state::ManagedTorrentHandle,
 };
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -32,6 +32,12 @@ pub struct SerializedTorrent {
     is_paused: bool,
     #[serde(default)]
     piece_picking: PiecePicking,
+    // Written by versions that know about them; older state loads with no limits.
+    #[serde(default)]
+    ratelimits: LimitsConfig,
+    // The torrent's own peer limit; `None` (and older state): the session default.
+    #[serde(default)]
+    peer_limit: Option<usize>,
 }
 
 impl SerializedTorrent {
@@ -61,6 +67,8 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             piece_picking: self.piece_picking,
+            ratelimits: self.ratelimits,
+            peer_limit: self.peer_limit,
             overwrite: true,
             ..Default::default()
         };

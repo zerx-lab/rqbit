@@ -77,7 +77,7 @@ use peer_binary_protocol::{
     },
 };
 use tokio::sync::{
-    Notify, OwnedSemaphorePermit, Semaphore,
+    Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -87,8 +87,8 @@ use crate::{
     Error,
     choker::{Choker, ChokerPeer, RECHOKE_INTERVAL, Registration, SlotClass, Transferred},
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    connection_limit::PeerPermits,
     file_ops::FileOps,
-    limits::Limits,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -197,8 +197,8 @@ pub struct TorrentStateLive {
     stats: AtomicStats,
     lengths: Lengths,
 
-    // Limits how many active (occupying network resources) peers there are at a moment in time.
-    peer_semaphore: Arc<Semaphore>,
+    // How many peers occupy network resources (connecting or connected) at a time is limited by
+    // shared.options.peer_slots and session_peer_slots; every peer task holds a permit of both.
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -224,7 +224,6 @@ pub struct TorrentStateLive {
     // We have every selected piece. Changes with the selection and with completed pieces, and is
     // read for every event reported to the peer policy.
     selection_complete: Arc<AtomicBool>,
-    ratelimits: Limits,
 
     // Decides which interested peers we upload to.
     choker: Arc<Choker>,
@@ -237,6 +236,13 @@ impl TorrentStateLive {
             .peer_max_request_window
             .unwrap_or(DEFAULT_PEER_REQUEST_WINDOW)
             .max(1)
+    }
+
+    // Whether another peer connection could start now: neither the torrent's peer limit nor
+    // the session's is reached.
+    fn has_room_for_peers(&self) -> bool {
+        let options = &self.shared.options;
+        options.peer_slots.has_room() && options.session_peer_slots.has_room()
     }
 
     pub(crate) fn new(
@@ -277,7 +283,6 @@ impl TorrentStateLive {
             .peer_policy
             .is_some()
             .then(unbounded_channel::<UploadRequest>);
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -302,9 +307,6 @@ impl TorrentStateLive {
                 ..Default::default()
             },
             lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
@@ -321,7 +323,6 @@ impl TorrentStateLive {
             throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
             refused_peers: Default::default(),
             selection_complete,
-            ratelimits,
             choker: Arc::new(Choker::new(
                 paused.shared.options.upload_slots,
                 Instant::now(),
@@ -412,15 +413,15 @@ impl TorrentStateLive {
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
-                return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
-            }
+        let options = &self.shared.options;
+        let Some(permits) =
+            PeerPermits::try_acquire(&options.peer_slots, &options.session_peer_slots)
+        else {
+            debug!("limit of live peers reached, dropping incoming peer");
+            self.peers.with_peer(checked_peer.addr, |p| {
+                atomic_inc(&p.stats.counters.incoming_connections);
+            });
+            return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
         };
 
         let counters = match self.peers.states.entry(checked_peer.addr) {
@@ -471,10 +472,13 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+            aframe!(self.clone().task_manage_incoming_peer(
+                checked_peer,
+                counters,
+                tx,
+                rx,
+                permits
+            )),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -501,7 +505,7 @@ impl TorrentStateLive {
                 _ = tx.closed() => {
                     continue;
                 }
-                res = self.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
+                res = self.shared.options.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
                     res?;
                 }
             };
@@ -573,7 +577,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        permits: PeerPermits,
     ) -> crate::Result<()> {
         let policy = self.peer_policy_binding(checked_peer.addr);
         let choker = self.choker_registration(&tx, policy.gate(), &counters);
@@ -630,14 +634,14 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        drop(permit);
+        drop(permits);
         Ok(())
     }
 
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        permits: PeerPermits,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -711,7 +715,7 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
+        drop(permits);
         Ok(())
     }
 
@@ -788,11 +792,15 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            // Held by the connection task for as long as it lives; see PeerPermits::acquire for
+            // why the torrent's permit comes first.
+            let options = &state.shared.options;
+            let permits =
+                PeerPermits::acquire(&options.peer_slots, &options.session_peer_slots).await?;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(addr, permits)),
             );
             if let Some(i) = connect_interval {
                 tokio::time::sleep(i).await;
@@ -1396,8 +1404,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             return they_wait;
         }
         // While we still look for peers to download from, a connection that does nothing is
-        // only kept for as long as no other peer could use it.
-        (they_wait || self.is_choked()) && self.state.peer_semaphore.available_permits() > 0
+        // only kept for as long as no other peer could use it: neither the torrent's peer limit
+        // nor the session's is reached.
+        (they_wait || self.is_choked()) && self.state.has_room_for_peers()
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {
@@ -2070,6 +2079,8 @@ impl PeerHandler {
                 aframe!(self.wait_for_request_slot()).await;
 
                 self.state
+                    .shared
+                    .options
                     .ratelimits
                     .prepare_for_download(NonZeroU32::new(request.length).unwrap())
                     .await?;
