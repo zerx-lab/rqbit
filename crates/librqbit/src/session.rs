@@ -427,6 +427,9 @@ pub struct DhtSessionConfig {
     pub port: Option<u16>,
     /// Persistence behavior. If None, persistence is disabled.
     pub persistence: Option<DhtPersistenceConfig>,
+    /// BEP 42 enforcement: DHT nodes whose id does not match their IP address are kept out of
+    /// the routing table and never become announce targets. Off by default.
+    pub enforce_node_id: bool,
 }
 
 impl Default for DhtSessionConfig {
@@ -435,6 +438,7 @@ impl Default for DhtSessionConfig {
             bootstrap_addrs: None,
             port: None,
             persistence: Some(DhtPersistenceConfig::default()),
+            enforce_node_id: false,
         }
     }
 }
@@ -648,13 +652,17 @@ impl Session {
 
             let dht = if let Some(dht_config) = opts.dht.take() {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
-                    PersistentDht::create(
+                    PersistentDht::create_with_config(
                         persistence_config,
                         dht_config.port,
                         opts.ipv4_only,
-                        dht_config.bootstrap_addrs,
-                        Some(token.clone()),
-                        bind_device.as_ref(),
+                        DhtConfig {
+                            bootstrap_addrs: dht_config.bootstrap_addrs,
+                            cancellation_token: Some(token.clone()),
+                            bind_device: bind_device.as_ref(),
+                            enforce_node_id: dht_config.enforce_node_id,
+                            ..Default::default()
+                        },
                     )
                     .await
                     .context("error initializing persistent DHT")?
@@ -665,6 +673,7 @@ impl Session {
                         cancellation_token: Some(token.child_token()),
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
+                        enforce_node_id: dht_config.enforce_node_id,
                         ..Default::default()
                     })
                     .await
