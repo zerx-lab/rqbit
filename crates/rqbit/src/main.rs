@@ -310,6 +310,10 @@ struct Opts {
     /// Never download from web seeds (BEP 19 `url-list` / magnet `ws=` HTTP sources)
     #[arg(long = "disable-web-seeds", env = "RQBIT_WEB_SEEDS_DISABLE")]
     disable_web_seeds: bool,
+
+    /// Disable the Fast Extension (BEP 6: HaveAll / HaveNone, rejects, allowed-fast pieces)
+    #[arg(long = "disable-fast-extension", env = "RQBIT_FAST_EXTENSION_DISABLE")]
+    disable_fast_extension: bool,
 }
 
 #[derive(Parser)]
@@ -716,6 +720,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         mse_mode: Default::default(),
         peer_backoff: None,
         peer_policy: None,
+        disable_fast_extension: opts.disable_fast_extension,
     };
 
     #[allow(clippy::needless_update)]
