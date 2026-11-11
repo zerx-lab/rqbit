@@ -28,6 +28,7 @@ use crate::{
     merge_streams::merge_streams,
     mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
+    peer_info_reader::MetadataHashes,
     peer_policy::{PeerPolicy, ThrottledUpload, canonical_ip},
     priority::Priorities,
     read_buf::ReadBuf,
@@ -1594,9 +1595,13 @@ impl Session {
                 {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
+                    // A `btmh`-only link (BEP 52) is a v2-only torrent: its swarm is known by
+                    // the truncated v2 hash.
+                    let info_hash_v2 = magnet.as_id32();
                     let info_hash = magnet
                         .as_id20()
-                        .context("magnet link didn't contain a BTv1 infohash")?;
+                        .or_else(|| info_hash_v2.map(|v2| v2.truncate_for_dht()))
+                        .context("magnet link has neither a btih nor a btmh info hash")?;
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -1606,7 +1611,7 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
-                        info_hash_v2: None,
+                        info_hash_v2,
                         tiers: magnet
                             .trackers
                             .into_iter()
@@ -1791,6 +1796,10 @@ impl Session {
 
         let mut seen_peers = Vec::new();
 
+        // A `btmh`-only magnet link of a hybrid torrent: the torrent is known by its v1 hash
+        // once the info dictionary tells it, as when added from its `.torrent`, and the swarm
+        // of the truncated v2 hash, which was looked up so far, is its second one.
+        let mut learned_v1 = None;
         let (metadata, info_hash_v2, peer_rx) = {
             match metadata {
                 Some(metadata) => {
@@ -1809,6 +1818,7 @@ impl Session {
                     let resolved_magnet = self
                         .resolve_magnet(
                             info_hash,
+                            info_hash_v2,
                             peer_rx,
                             &tracker_comms.own_tiers(),
                             Some(magnet_peer_opts),
@@ -1832,25 +1842,43 @@ impl Session {
                     // too.
                     let resolved_v2 = info_hash_v2.or(resolved_magnet.info_hash_v2);
                     let is_private = resolved_magnet.metadata.info.info().private;
-                    if alt_tracker_comms.is_none()
-                        && let Some(alt) = alt_info_hash(info_hash, resolved_v2)
-                    {
-                        let alt_trackers = self.new_torrent_trackers(
-                            alt,
+                    // The other swarm of a hybrid torrent: the v2 one for a `btih` link, the
+                    // v1 one for a `btmh`-only link.
+                    let other_swarm = if resolved_magnet.info_hash != info_hash {
+                        Some(resolved_magnet.info_hash)
+                    } else if alt_tracker_comms.is_none() {
+                        alt_info_hash(info_hash, resolved_v2)
+                    } else {
+                        None
+                    };
+                    if let Some(other) = other_swarm {
+                        let other_trackers = self.new_torrent_trackers(
+                            other,
                             tracker_comms.own_tiers(),
                             is_private,
                             opts.force_tracker_interval,
                         );
-                        if let Some(alt_rx) =
-                            self.swarm_peer_rx(alt, &alt_trackers, announce, is_private)
+                        if let Some(other_rx) =
+                            self.swarm_peer_rx(other, &other_trackers, announce, is_private)
                         {
-                            peer_rx = merge_streams(peer_rx, alt_rx).boxed();
+                            peer_rx = merge_streams(peer_rx, other_rx).boxed();
                         }
-                        alt_tracker_comms = Some((alt, alt_trackers));
+                        if other == resolved_magnet.info_hash {
+                            learned_v1 = Some((other, other_trackers));
+                        } else {
+                            alt_tracker_comms = Some((other, other_trackers));
+                        }
                     }
                     (resolved_magnet.metadata, resolved_v2, Some(peer_rx))
                 }
             }
+        };
+        let (info_hash, tracker_comms) = match learned_v1 {
+            Some((v1, v1_trackers)) => {
+                alt_tracker_comms = Some((info_hash, tracker_comms));
+                (v1, v1_trackers)
+            }
+            None => (info_hash, tracker_comms),
         };
 
         trace!("Torrent metadata: {:#?}", &metadata.info.info());
@@ -2961,16 +2989,24 @@ impl Session {
         }))
     }
 
+    /// Reads the info dictionary of a magnet link from peers. It must hash to the link's
+    /// `btih` hash, its `btmh` one (BEP 52), or both: `info_hash` is the truncated v2 hash
+    /// of a `btmh`-only link, which says nothing about the SHA-1 hash.
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
+        info_hash_v2: Option<Id32>,
         peer_rx: PeerStream,
         tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
+        let v1 =
+            (info_hash_v2.map(|v2| v2.truncate_for_dht()) != Some(info_hash)).then_some(info_hash);
+        let hashes =
+            MetadataHashes::new(v1, info_hash_v2).context("a magnet link without info hash")?;
         match read_metainfo_from_peer_receiver(
             self.peer_id,
-            info_hash,
+            hashes,
             Default::default(),
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
@@ -2988,7 +3024,7 @@ impl Session {
                 seen,
             } => {
                 trace!(?info, "received result from DHT");
-                let (_, info_hash_v2) = compute_info_hashes(&info, info_bytes.as_ref());
+                let (info_hash, info_hash_v2) = compute_info_hashes(&info, info_bytes.as_ref());
                 let info = info.validate()?;
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
@@ -2996,6 +3032,7 @@ impl Session {
                         torrent_file_from_info_bytes(info_bytes.as_ref(), tiers)?,
                         info_bytes.0,
                     )?,
+                    info_hash,
                     info_hash_v2,
                     peer_rx: rx,
                     seen_peers: {
@@ -3077,6 +3114,9 @@ impl Session {
 
 pub(crate) struct ResolveMagnetResult {
     pub metadata: TorrentMetadata,
+    /// The info hash the torrent is known by: the SHA-1 one, or the truncated v2 hash of a
+    /// v2-only torrent.
+    pub info_hash: Id20,
     /// BEP 52: the SHA-256 info hash, if the metadata is that of a v2 or hybrid torrent.
     pub info_hash_v2: Option<Id32>,
     pub peer_rx: PeerStream,
