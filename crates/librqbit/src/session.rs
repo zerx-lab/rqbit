@@ -2164,6 +2164,7 @@ impl Session {
                 options: self.tracker_announce,
                 timings: TrackerTimings::default(),
                 enabled: !self.disable_trackers,
+                i2p: Default::default(),
             },
             tiers,
             own_tiers,
