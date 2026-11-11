@@ -5,24 +5,10 @@ use std::{
 };
 
 use super::fake_peer::{
-    BLOCK, ClientOpts, FakePeer, Fixture, Recv, SeederOpts, Wire, peer_id, run, start_client,
-    start_seeder, uploaded,
+    BLOCK, ClientOpts, FakePeer, Fixture, Recv, SeederOpts, Wire, expect_uploaded, peer_id, run,
+    start_client, start_seeder,
 };
-use crate::{UploadSlots, tests::test_util::wait_until};
-
-// A block is counted as uploaded once the write returns, which may be after the peer has read
-// it: the counter is waited for.
-async fn expect_uploaded(seed: &Fixture, bytes: u64) -> anyhow::Result<()> {
-    wait_until(
-        || {
-            let got = uploaded(seed);
-            anyhow::ensure!(got == bytes, "uploaded {got}, expected {bytes}");
-            Ok(())
-        },
-        Duration::from_secs(5),
-    )
-    .await
-}
+use crate::UploadSlots;
 
 fn fixed(slots: u32) -> UploadSlots {
     UploadSlots::Fixed(NonZeroU32::new(slots).unwrap())

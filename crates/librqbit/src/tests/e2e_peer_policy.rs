@@ -676,6 +676,20 @@ fn uploaded(f: &Fixture) -> u64 {
     f.handle.live().map_or(0, |l| l.get_uploaded_bytes())
 }
 
+/// A block is counted as uploaded once its write returns, which may be after the peer has read
+/// it: the counter is waited for.
+async fn expect_uploaded(f: &Fixture, bytes: u64) -> anyhow::Result<()> {
+    wait_until(
+        || {
+            let got = uploaded(f);
+            anyhow::ensure!(got == bytes, "uploaded {got}, expected {bytes}");
+            Ok(())
+        },
+        Duration::from_secs(5),
+    )
+    .await
+}
+
 async fn wait_for(
     what: &str,
     mut cond: impl FnMut() -> bool,
@@ -846,13 +860,13 @@ async fn test_cancelled_blocks_are_not_uploaded() -> anyhow::Result<()> {
             rest.iter().all(|m| !matches!(m, Wire::Piece { .. })),
             "cancelled blocks were sent: {rest:?}"
         );
-        assert_eq!(uploaded(&seed), 2 * BLOCK as u64);
+        expect_uploaded(&seed, 2 * BLOCK as u64).await?;
 
         // Asking again for a block that was cancelled works.
         peer.request(0, BLOCK, BLOCK).await?;
         let again = peer.expect_pieces(1, Duration::from_secs(10)).await?;
         assert_eq!((again[0].0, again[0].1), (0, BLOCK));
-        assert_eq!(uploaded(&seed), 3 * BLOCK as u64);
+        expect_uploaded(&seed, 3 * BLOCK as u64).await?;
         Ok(())
     })
     .await
@@ -1038,8 +1052,13 @@ async fn test_choke_stops_uploads_and_keeps_the_connection() -> anyhow::Result<(
             Duration::from_secs(5),
         )
         .await?;
-        assert_eq!(uploaded(&seed), BLOCK as u64);
-        assert_eq!(policy.count(|e| matches!(e, Ev::Uploaded(..))), 1);
+        expect_uploaded(&seed, BLOCK as u64).await?;
+        wait_for(
+            "the upload reported",
+            || policy.count(|e| matches!(e, Ev::Uploaded(..))) == 1,
+            Duration::from_secs(5),
+        )
+        .await?;
 
         // The connection is still alive in the session as well.
         assert_eq!(seed.session.disconnect_peers_where(|_| true), 1);
