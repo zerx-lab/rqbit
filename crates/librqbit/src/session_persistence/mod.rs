@@ -2,7 +2,10 @@ pub mod json;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -32,6 +35,9 @@ pub struct SerializedTorrent {
     is_paused: bool,
     #[serde(default)]
     piece_picking: PiecePicking,
+    // Session::rename_file: file index -> path relative to output_folder.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    renamed_files: BTreeMap<usize, PathBuf>,
 }
 
 impl SerializedTorrent {
@@ -61,6 +67,7 @@ impl SerializedTorrent {
             ),
             only_files: self.only_files,
             piece_picking: self.piece_picking,
+            renamed_files: self.renamed_files,
             overwrite: true,
             ..Default::default()
         };

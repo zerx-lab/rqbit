@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{
     PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory, session::TorrentId,
@@ -8,7 +8,7 @@ use anyhow::Context;
 use futures::{StreamExt, stream::BoxStream};
 use librqbit_core::{Id20, spawn_utils::spawn};
 use sqlx::{Pool, Postgres};
-use tracing::debug_span;
+use tracing::{debug_span, warn};
 
 use super::{SerializedTorrent, SessionPersistenceStore};
 
@@ -28,10 +28,22 @@ struct TorrentsTableRecord {
     is_paused: bool,
     sequential: bool,
     first_last_pieces_first: bool,
+    // Session::rename_file, as a JSON object (file index -> relative path). NULL if none.
+    renamed_files: Option<String>,
 }
 
 impl TorrentsTableRecord {
     fn into_serialized_torrent(self) -> Option<(TorrentId, SerializedTorrent)> {
+        let renamed_files = match self.renamed_files.as_deref() {
+            None => BTreeMap::new(),
+            Some(s) => match serde_json::from_str(s) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(id = self.id, "ignoring broken renamed_files {s:?}: {e:#}");
+                    BTreeMap::new()
+                }
+            },
+        };
         Some((
             self.id as TorrentId,
             SerializedTorrent {
@@ -47,9 +59,21 @@ impl TorrentsTableRecord {
                     sequential: self.sequential,
                     first_last_pieces_first: self.first_last_pieces_first,
                 },
+                renamed_files,
             },
         ))
     }
+}
+
+// The renamed_files column of a torrent: NULL when nothing is renamed.
+fn renamed_files_column(torrent: &ManagedTorrentHandle) -> anyhow::Result<Option<String>> {
+    let renamed = torrent.shared().renamed_files();
+    if renamed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&renamed)
+        .map(Some)
+        .context("error serializing renamed_files")
 }
 
 impl PostgresSessionStorage {
@@ -92,6 +116,7 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS first_last_pieces_first BOOLEAN NOT NULL DEFAULT FALSE"
         );
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS renamed_files TEXT");
 
         Ok(Self { pool })
     }
@@ -114,8 +139,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         sqlx::query(q)
@@ -145,6 +170,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(torrent.is_paused())
             .bind(piece_picking.sequential)
             .bind(piece_picking.first_last_pieces_first)
+            .bind(renamed_files_column(torrent)?)
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -177,8 +203,10 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
         let piece_picking = torrent.piece_picking();
+        // The output folder changes with Session::move_storage, the file paths with
+        // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4 WHERE id = $5",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6 WHERE id = $7",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -188,10 +216,18 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(torrent.is_paused())
         .bind(piece_picking.sequential)
         .bind(piece_picking.first_last_pieces_first)
+        .bind(
+            torrent
+                .output_folder()
+                .to_str()
+                .context("output_folder")?
+                .to_owned(),
+        )
+        .bind(renamed_files_column(torrent)?)
         .bind::<i32>(id.try_into()?)
-            .execute(&self.pool)
-            .await
-            .context("error executing UPDATE torrents")?;
+        .execute(&self.pool)
+        .await
+        .context("error executing UPDATE torrents")?;
         Ok(())
     }
 
