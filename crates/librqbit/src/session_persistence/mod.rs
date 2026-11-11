@@ -55,6 +55,9 @@ pub struct SerializedTorrent {
     // Explicit piece priorities, (piece index, level).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     piece_priorities: Vec<(u32, u8)>,
+    // Super seeding (BEP 16); missing in older state: off.
+    #[serde(default)]
+    super_seeding: bool,
     // The web seeds of the torrent, including the ones added at run time and without the ones
     // removed. Missing in older state: the torrent's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +116,7 @@ impl SerializedTorrent {
             peer_limit: self.peer_limit,
             file_priorities: self.file_priorities,
             piece_priorities: (!self.piece_priorities.is_empty()).then_some(self.piece_priorities),
+            super_seeding: self.super_seeding,
             replace_web_seeds: self.web_seeds.is_some(),
             web_seeds: self.web_seeds,
             disable_web_seeds: self.disable_web_seeds,
@@ -193,6 +197,23 @@ mod tests {
         assert_eq!(opts.ratelimits, limits);
         assert_eq!(opts.peer_limit, Some(7));
         assert!(opts.paused);
+    }
+
+    #[test]
+    fn test_super_seeding_round_trip_and_old_state() {
+        let old = format!(
+            r#"{{"info_hash":"{INFO_HASH}","trackers":[],"output_folder":"/tmp/t","only_files":null,"is_paused":false}}"#
+        );
+        let mut t: SerializedTorrent = serde_json::from_str(&old).unwrap();
+        assert!(
+            !t.super_seeding,
+            "state written before super seeding loads with it off"
+        );
+        t.super_seeding = true;
+        let json = serde_json::to_string(&t).unwrap();
+        let t: SerializedTorrent = serde_json::from_str(&json).unwrap();
+        let (_, opts) = t.into_add_torrent().unwrap();
+        assert!(opts.super_seeding);
     }
 
     #[test]

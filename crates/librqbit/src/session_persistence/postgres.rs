@@ -39,6 +39,7 @@ struct TorrentsTableRecord {
     // Explicit piece priorities as two parallel arrays: piece index and level.
     piece_priority_pieces: Vec<i64>,
     piece_priority_levels: Vec<i16>,
+    super_seeding: bool,
     // NULL in rows written before web seeds: the torrent's own are used.
     web_seeds: Option<Vec<String>>,
     // Web seeds are disabled for this torrent.
@@ -118,6 +119,7 @@ impl TorrentsTableRecord {
                     .zip(self.piece_priority_levels)
                     .filter_map(|(p, l)| Some((u32::try_from(p).ok()?, u8::try_from(l).ok()?)))
                     .collect(),
+                super_seeding: self.super_seeding,
                 web_seeds: self.web_seeds,
                 disable_web_seeds: self.disable_web_seeds,
                 move_in_progress,
@@ -197,6 +199,9 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_levels SMALLINT[] NOT NULL DEFAULT '{}'"
         );
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS super_seeding BOOLEAN NOT NULL DEFAULT FALSE"
+        );
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS web_seeds TEXT[]");
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS disable_web_seeds BOOLEAN NOT NULL DEFAULT false"
@@ -224,8 +229,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, web_seeds, move_in_progress, disable_web_seeds)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, super_seeding, web_seeds, move_in_progress, disable_web_seeds)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
@@ -264,6 +269,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(file_priority_column(torrent))
             .bind(pieces)
             .bind(levels)
+            .bind(torrent.super_seeding())
             .bind(torrent.web_seed_urls())
             .bind(move_in_progress_column(torrent)?)
             .bind(torrent.web_seeds_disabled_for_torrent())
@@ -304,7 +310,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         // The output folder changes with Session::move_storage, the file paths with
         // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, web_seeds = $13, move_in_progress = $14, disable_web_seeds = $15 WHERE id = $16",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, super_seeding = $13, web_seeds = $14, move_in_progress = $15, disable_web_seeds = $16 WHERE id = $17",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -328,6 +334,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(file_priority_column(torrent))
         .bind(pieces)
         .bind(levels)
+        .bind(torrent.super_seeding())
         .bind(torrent.web_seed_urls())
         .bind(move_in_progress_column(torrent)?)
         .bind(torrent.web_seeds_disabled_for_torrent())
