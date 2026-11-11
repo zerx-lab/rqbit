@@ -24,6 +24,8 @@
 //!
 
 #![warn(clippy::cast_possible_truncation)]
+// The `serde_json::json!` listing of the HTTP API endpoints needs more than the default.
+#![recursion_limit = "256"]
 
 macro_rules! aframe {
     ($e:expr) => {{
