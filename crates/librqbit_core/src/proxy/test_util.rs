@@ -9,9 +9,10 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use parking_lot::Mutex;
@@ -49,8 +50,13 @@ pub struct FakeProxyOptions {
     pub unspecified_relay_addr: bool,
     /// Whether the URL tells the client to let the proxy resolve host names.
     pub remote_dns: bool,
+    /// Whether the SOCKS5 relay gives the source of an answer by name (`ATYP=3`) when the
+    /// client named the destination, instead of giving its address.
+    pub name_sources: bool,
     /// Whether every request is refused.
     pub refuse: bool,
+    /// The address the proxy listens on (`127.0.0.1` by default).
+    pub listen_ip: IpAddr,
 }
 
 impl FakeProxyOptions {
@@ -62,7 +68,9 @@ impl FakeProxyOptions {
             udp: true,
             unspecified_relay_addr: false,
             remote_dns: false,
+            name_sources: false,
             refuse: false,
+            listen_ip: Ipv4Addr::LOCALHOST.into(),
         }
     }
 }
@@ -124,9 +132,9 @@ impl Drop for FakeProxy {
 }
 
 impl FakeProxy {
-    /// Starts a proxy on a free port of `127.0.0.1`.
+    /// Starts a proxy on a free port of [`FakeProxyOptions::listen_ip`].
     pub async fn start(opts: FakeProxyOptions) -> Self {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = TcpListener::bind((opts.listen_ip, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let this = Self {
             addr,
@@ -189,6 +197,20 @@ impl FakeProxy {
         format!("{}://{credentials}{}", self.scheme(), self.addr)
     }
 
+    /// [`Self::url`] with `host` in place of the IP address the proxy listens on, e.g. a name
+    /// that resolves to it.
+    pub fn url_with_host(&self, host: &str) -> String {
+        let url = self.url();
+        let ip = match self.addr {
+            SocketAddr::V4(a) => a.ip().to_string(),
+            SocketAddr::V6(a) => format!("[{}]", a.ip()),
+        };
+        match url.rsplit_once(&format!("{ip}:")) {
+            Some((before, port)) => format!("{before}{host}:{port}"),
+            None => url,
+        }
+    }
+
     /// The proxy URL with other credentials (for wrong-password tests).
     pub fn url_with_credentials(&self, user: &str, pass: &str) -> String {
         format!(
@@ -221,10 +243,23 @@ impl FakeProxy {
         }
     }
 
-    /// Starts a stopped proxy again on the same port.
+    /// Starts a stopped proxy again on the same port. The port can stay busy for a moment after
+    /// the stop (connections in their last states, another process grabbing it): binding is
+    /// retried for a few seconds.
     pub async fn restart(&self) {
         self.stop().await;
-        let listener = TcpListener::bind(self.addr).await.unwrap();
+        let mut attempts = 0;
+        let listener = loop {
+            match TcpListener::bind(self.addr).await {
+                Ok(listener) => break listener,
+                Err(e) if attempts < 50 => {
+                    attempts += 1;
+                    tracing::debug!("rebinding {}: {e:#}", self.addr);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("can't bind {} again: {e:#}", self.addr),
+            }
+        };
         self.run(listener);
     }
 
@@ -486,6 +521,8 @@ async fn serve_udp_association(
     shared.log.lock().associations += 1;
 
     let mut client: Option<SocketAddr> = None;
+    // The destinations the client gave by name, by address.
+    let mut names: HashMap<SocketAddr, String> = HashMap::new();
     let mut buf = vec![0u8; 65536];
     let mut control_buf = [0u8; 64];
     loop {
@@ -513,6 +550,9 @@ async fn serve_udp_association(
                     let Ok(dest) = resolve(&target).await else {
                         continue;
                     };
+                    if target.parse::<SocketAddr>().is_err() {
+                        names.insert(dest, target.clone());
+                    }
                     let payload = d[header_len..].to_vec();
                     let _ = relay.send_to(&payload, dest).await;
                     shared.log.lock().datagrams.push(RelayedDatagram {
@@ -522,7 +562,19 @@ async fn serve_udp_association(
                     });
                 } else {
                     let mut out = vec![0, 0, 0];
-                    out.extend_from_slice(&socks5_addr(from));
+                    let name = names
+                        .get(&from)
+                        .filter(|_| shared.opts.name_sources)
+                        .and_then(|t| t.rsplit_once(':'));
+                    match name {
+                        Some((host, _)) => {
+                            out.push(3);
+                            out.push(u8::try_from(host.len()).map_err(|_| bad("name"))?);
+                            out.extend_from_slice(host.as_bytes());
+                            out.extend_from_slice(&from.port().to_be_bytes());
+                        }
+                        None => out.extend_from_slice(&socks5_addr(from)),
+                    }
                     out.extend_from_slice(d);
                     let _ = relay.send_to(&out, client).await;
                     shared.log.lock().datagrams_to_client += 1;
@@ -572,9 +624,11 @@ async fn serve_socks4(stream: &mut TcpStream, shared: &Shared) -> R<()> {
     relay_tcp(stream, out).await
 }
 
+/// `CONNECT host:port` tunnels, and plain requests in absolute form (`GET http://host/path`,
+/// what an HTTP client sends for `http://` URLs) forwarded in origin form.
 async fn serve_http(stream: &mut TcpStream, shared: &Shared) -> R<()> {
     let mut buf = Vec::new();
-    let (target, auth) = loop {
+    let (target, auth, forward) = loop {
         let mut chunk = [0u8; 1024];
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
@@ -586,18 +640,40 @@ async fn serve_http(stream: &mut TcpStream, shared: &Shared) -> R<()> {
         match req.parse(&buf).map_err(|_| bad("http"))? {
             httparse::Status::Partial => continue,
             httparse::Status::Complete(_) => {
-                if req.method != Some("CONNECT") {
-                    stream
-                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
-                        .await?;
-                    return Ok(());
-                }
                 let auth = req
                     .headers
                     .iter()
                     .find(|h| h.name.eq_ignore_ascii_case("proxy-authorization"))
                     .map(|h| h.value.to_vec());
-                break (req.path.unwrap_or_default().to_owned(), auth);
+                let path = req.path.unwrap_or_default();
+                let method = req.method.unwrap_or_default();
+                if method == "CONNECT" {
+                    break (path.to_owned(), auth, None);
+                }
+                let Some(rest) = path.strip_prefix("http://") else {
+                    stream
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                        .await?;
+                    return Ok(());
+                };
+                let (authority, origin) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+                let has_port = authority
+                    .rsplit_once(':')
+                    .is_some_and(|(_, p)| !p.is_empty() && !p.contains(']'));
+                let target = if has_port {
+                    authority.to_owned()
+                } else {
+                    format!("{authority}:80")
+                };
+                let origin = if origin.is_empty() { "/" } else { origin };
+                // The request line rewritten, then the headers and whatever followed them.
+                let line_end = buf
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .ok_or(bad("http"))?;
+                let mut forward = format!("{method} {origin} HTTP/1.1").into_bytes();
+                forward.extend_from_slice(&buf[line_end..]);
+                break (target, auth, Some(forward));
             }
         }
     };
@@ -619,7 +695,7 @@ async fn serve_http(stream: &mut TcpStream, shared: &Shared) -> R<()> {
         stream.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
-    let out = match connect_and_log(&target, shared).await {
+    let mut out = match connect_and_log(&target, shared).await {
         Ok(out) => out,
         Err(_) => {
             stream
@@ -628,9 +704,14 @@ async fn serve_http(stream: &mut TcpStream, shared: &Shared) -> R<()> {
             return Ok(());
         }
     };
-    stream
-        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        .await?;
+    match forward {
+        Some(request) => out.write_all(&request).await?,
+        None => {
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await?
+        }
+    }
     relay_tcp(stream, out).await
 }
 

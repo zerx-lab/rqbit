@@ -40,6 +40,10 @@ pub(crate) struct Probe {
     pub renamed: Mutex<Vec<(usize, PathBuf, PathBuf)>>,
     /// The destination of every move_storage().
     pub moved_to: Mutex<Vec<PathBuf>>,
+    /// The `commit` of every finish_move_storage().
+    pub finished_moves: Mutex<Vec<bool>>,
+    /// How many times forget_cached_data() was called.
+    pub forgot_cached_data: Mutex<usize>,
 }
 
 impl TorrentStorage for Probe {
@@ -100,6 +104,16 @@ impl TorrentStorage for Probe {
             adopted_files: vec![7],
         })
     }
+
+    fn finish_move_storage(&self, commit: bool) -> anyhow::Result<()> {
+        self.finished_moves.lock().push(commit);
+        Ok(())
+    }
+
+    fn forget_cached_data(&self) -> anyhow::Result<()> {
+        *self.forgot_cached_data.lock() += 1;
+        Ok(())
+    }
 }
 
 // Everything a wrapper has to pass through to the storage it wraps and can't decide on
@@ -147,5 +161,21 @@ pub(crate) fn assert_forwards_defaults<S: TorrentStorage>(storage: &S, probe: &P
         *probe.moved_to.lock(),
         vec![PathBuf::from("/elsewhere")],
         "move_storage() didn't reach the storage: the files would stay where they were"
+    );
+
+    storage.finish_move_storage(true).unwrap();
+    assert_eq!(
+        *probe.finished_moves.lock(),
+        vec![true],
+        "finish_move_storage() didn't reach the storage: what the move replaced or left \
+         behind would stay forever"
+    );
+
+    storage.forget_cached_data().unwrap();
+    assert_eq!(
+        *probe.forgot_cached_data.lock(),
+        1,
+        "forget_cached_data() didn't reach the storage: a cache under the wrapper would \
+         answer a recheck instead of the disk"
     );
 }
