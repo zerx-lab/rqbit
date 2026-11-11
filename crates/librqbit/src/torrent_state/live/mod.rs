@@ -1732,6 +1732,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
         // How many requests we queue for a peer, see MAX_QUEUED_UPLOADS_PER_PEER.
         handshake.reqq = Some(MAX_QUEUED_UPLOADS_PER_PEER);
+        // No PEX with a peer we never exchange peers with (an I2P peer, or any peer of an
+        // I2P-only torrent): it must not wait for messages that never come.
+        if !self.state.shared.net.pex_with(&self.addr) {
+            handshake.m.ut_pex = None;
+        }
 
         Ok(())
     }
