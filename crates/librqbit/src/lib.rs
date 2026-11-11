@@ -95,7 +95,10 @@ pub use error::{Error, Result};
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use choker::UploadSlots;
-pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
+pub use create_torrent_file::{
+    CreateTorrentCancelled, CreateTorrentOptions, CreateTorrentProgress,
+    CreateTorrentProgressCallback, CreateTorrentResult, auto_piece_length, create_torrent,
+};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use librqbit_upnp::{
@@ -131,6 +134,8 @@ pub use librqbit_core::peer_id::*;
 /// checked (and shown without its password) before a session is created with it.
 pub use librqbit_core::proxy::{ProxyConfig, ProxyKind, ProxyUrlError};
 pub use librqbit_core::torrent_metainfo::*;
+/// The format of a torrent, re-exported for [`CreateTorrentOptions::version`].
+pub use librqbit_core::metainfo_v2::TorrentVersion;
 
 #[cfg(test)]
 mod tests;
