@@ -731,6 +731,8 @@ fn build_info(
                     TorrentMetaV1File {
                         length: file.len,
                         path: path_of(file),
+                        // Paths are UTF-8 already, like libtorrent no `path.utf-8`.
+                        path_utf8: None,
                         attr: None,
                         sha1: None,
                         symlink_path: None,
@@ -739,6 +741,7 @@ fn build_info(
                 V1Entry::Pad(len) => TorrentMetaV1File {
                     length: len,
                     path: vec![bytes_of(".pad"), bytes_of(&len.to_string())],
+                    path_utf8: None,
                     attr: Some(bytes_of("p")),
                     sha1: None,
                     symlink_path: None,
@@ -767,6 +770,8 @@ fn build_info(
     };
     Ok(TorrentMetaV1Info {
         name: Some(bytes_of(&content.name)),
+        // The name is UTF-8 already, like libtorrent no `name.utf-8`.
+        name_utf8: None,
         pieces: hashes.pieces.clone().map(ByteBufOwned::from),
         piece_length,
         length,

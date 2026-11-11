@@ -24,6 +24,8 @@
 //!
 
 #![warn(clippy::cast_possible_truncation)]
+// The `serde_json::json!` listing of the HTTP API endpoints needs more than the default.
+#![recursion_limit = "256"]
 
 macro_rules! aframe {
     ($e:expr) => {{
@@ -89,6 +91,7 @@ pub mod upnp_server_adapter;
 mod vectored_traits;
 #[cfg(feature = "watch")]
 pub mod watch;
+mod webseed;
 
 pub use error::{Error, Result};
 
@@ -125,12 +128,17 @@ pub use torrent_state::{
 };
 pub use tracker_comms::{TrackerAnnounceOptions, TrackerState, TrackerStats};
 pub use type_aliases::FileInfos;
+pub use webseed::{WebSeedState, WebSeedStats};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
+/// Version-independent piece verification (v1 SHA-1, v2 merkle, both for hybrid torrents),
+/// re-exported so that an embedder can check data on disk against a torrent's metadata.
+pub use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 pub use librqbit_core::magnet::*;
-/// The format of a torrent, re-exported for [`CreateTorrentOptions::version`].
-pub use librqbit_core::metainfo_v2::TorrentVersion;
+/// The format of a torrent ([`CreateTorrentOptions::version`]) and the version-independent
+/// piece verifier.
+pub use librqbit_core::metainfo_v2::{PieceVerdict, PieceVerifier, TorrentVersion};
 pub use librqbit_core::peer_id::*;
 /// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
 /// checked (and shown without its password) before a session is created with it.

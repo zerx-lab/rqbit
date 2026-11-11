@@ -6,7 +6,7 @@ mod storage_ops;
 mod streaming;
 pub mod utils;
 
-pub(crate) use storage_ops::validate_renames;
+pub(crate) use storage_ops::{Quiesced, StorageLoan, validate_renames};
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use buffers::ByteBufOwned;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use librqbit_core::hash_id::Id20;
+use librqbit_core::hash_id::{Id20, Id32};
 use librqbit_core::lengths::Lengths;
 
 use librqbit_core::spawn_utils::spawn_with_cancel;
@@ -124,6 +124,9 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) priorities: Priorities,
     // Kept here, not in the live state, so it survives pause / resume.
     pub(crate) piece_picking: PiecePicking,
+    // Set while a storage operation has the storage out of the state (see `storage_ops`), so
+    // that a stream reading meanwhile waits for it instead of reading from what's left.
+    pub(crate) storage_on_loan: bool,
 }
 
 pub(crate) struct ManagedTorrentOptions {
@@ -222,10 +225,16 @@ impl TorrentMetadata {
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
+    /// BEP 52: SHA-256 of the info dictionary of a v2 or hybrid torrent. (`info_hash` is its
+    /// truncation for a v2-only torrent, and the SHA-1 for a hybrid one.)
+    pub info_hash_v2: Option<Id32>,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
     /// Talks to the trackers of the torrent. See [`tracker_comms::TorrentTrackers`].
     pub(crate) tracker_comms: Arc<tracker_comms::TorrentTrackers>,
+    /// The trackers that announce the truncated v2 hash of a hybrid torrent
+    /// ([`Self::alt_info_hash`]); the same tiers as `tracker_comms`.
+    pub(crate) alt_tracker_comms: Option<Arc<tracker_comms::TorrentTrackers>>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -241,6 +250,8 @@ pub struct ManagedTorrentShared {
     // Where the files are. Session::move_storage and Session::rename_file change it at run
     // time. A leaf lock: nothing else is locked while it's held.
     pub(crate) location: RwLock<StorageLocation>,
+    /// The web seeds (BEP 19) of the torrent.
+    pub(crate) web_seeds: crate::webseed::WebSeeds,
 }
 
 /// Where the files of a torrent are stored.
@@ -249,11 +260,57 @@ pub(crate) struct StorageLocation {
     pub output_folder: PathBuf,
     // Files whose path, relative to the output folder, isn't the one the torrent gives them.
     pub renamed_files: BTreeMap<usize, PathBuf>,
+    // Set while Session::move_storage moves the files, and persisted before the first file
+    // moves, so that a move the process didn't live to finish is undone on the next start.
+    pub move_in_progress: Option<MoveInProgress>,
+}
+
+/// A [`Session::move_storage`] that may have moved some files: those at `files` (relative
+/// paths) under the persisted output folder may be under `to` instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MoveInProgress {
+    pub to: PathBuf,
+    pub files: Vec<PathBuf>,
+}
+
+/// The other 20-byte info hash a hybrid torrent is known by, next to its v1 hash `info_hash`:
+/// the truncated v2 hash, which peers of the v2 swarm use in handshakes and announces.
+pub(crate) fn alt_info_hash(info_hash: Id20, info_hash_v2: Option<Id32>) -> Option<Id20> {
+    info_hash_v2
+        .map(|h| h.truncate_for_dht())
+        .filter(|h| *h != info_hash)
 }
 
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The other 20-byte info hash a hybrid torrent is known by: its truncated v2 hash, which
+    /// peers of the v2 swarm use in handshakes and which we announce next to `info_hash`.
+    pub fn alt_info_hash(&self) -> Option<Id20> {
+        alt_info_hash(self.info_hash, self.info_hash_v2)
+    }
+
+    /// Whether `h` is one of the 20-byte info hashes of the torrent (for a hybrid torrent:
+    /// the v1 hash or the truncated v2 hash).
+    pub fn has_info_hash(&self, h: Id20) -> bool {
+        h == self.info_hash || self.alt_info_hash() == Some(h)
+    }
+
+    /// Whether the torrent is the one identified by `info_hash` (a v1 or truncated v2 hash) or
+    /// by the full v2 hash `info_hash_v2`: either one is enough.
+    pub(crate) fn is_same_torrent(&self, info_hash: Id20, info_hash_v2: Option<Id32>) -> bool {
+        self.has_info_hash(info_hash)
+            || info_hash_v2.is_some_and(|v2| self.info_hash_v2 == Some(v2))
+    }
+
+    /// Everything that talks to trackers for the torrent: the trackers of `info_hash`, then
+    /// those of the truncated v2 hash of a hybrid torrent.
+    pub(crate) fn all_tracker_comms(
+        &self,
+    ) -> impl Iterator<Item = &Arc<tracker_comms::TorrentTrackers>> {
+        std::iter::once(&self.tracker_comms).chain(self.alt_tracker_comms.as_ref())
     }
 
     /// The folder the files of the torrent are stored under right now.
@@ -291,6 +348,11 @@ impl ManagedTorrentShared {
     /// (relative to [`Self::output_folder`]).
     pub fn renamed_files(&self) -> BTreeMap<usize, PathBuf> {
         self.location.read().renamed_files.clone()
+    }
+
+    /// The move that persistence must remember, see [`StorageLocation::move_in_progress`].
+    pub(crate) fn move_in_progress(&self) -> Option<MoveInProgress> {
+        self.location.read().move_in_progress.clone()
     }
 }
 
@@ -364,6 +426,11 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// BEP 52: the SHA-256 info hash of a v2 or hybrid torrent.
+    pub fn info_hash_v2(&self) -> Option<Id32> {
+        self.shared.info_hash_v2
     }
 
     /// The files with a non-zero priority, or None when every file that is not padding has one.
@@ -553,6 +620,11 @@ impl ManagedTorrent {
                     let init = init.clone();
                     init.clear_pause_request();
                     if !init.try_start_check() {
+                        // The running check started without this stream (e.g. a paused add
+                        // or a recheck of a paused torrent): keep it for when it goes live.
+                        if let Some(peer_rx) = peer_rx {
+                            init.stash_peer_rx(peer_rx);
+                        }
                         return Ok(());
                     }
 
@@ -567,12 +639,30 @@ impl ManagedTorrent {
                         async move {
                             let concurrent_init_semaphore =
                                 session.concurrent_initialize_semaphore.clone();
-                            let _permit = concurrent_init_semaphore
-                                .acquire()
-                                .await
-                                .context("bug: concurrent init semaphore was closed")?;
+                            // A check still waiting for its turn gives it up when asked to
+                            // pause, as a running one stops between two pieces: a pause or a
+                            // storage operation doesn't wait for other torrents' checks.
+                            let acquire = concurrent_init_semaphore.acquire();
+                            tokio::pin!(acquire);
+                            let permit = loop {
+                                let notified = t.state_change_notify.notified();
+                                tokio::pin!(notified);
+                                notified.as_mut().enable();
+                                if init.is_pause_requested() {
+                                    break None;
+                                }
+                                tokio::select! {
+                                    permit = &mut acquire => break Some(
+                                        permit.context("bug: concurrent init semaphore was closed")?,
+                                    ),
+                                    _ = notified => {}
+                                }
+                            };
 
-                            let check_result = init.check().await;
+                            let check_result = match &permit {
+                                Some(_) => init.check().await,
+                                None => Err(InitialCheckPaused.into()),
+                            };
 
                             // The check is over only once its result is in the state, under
                             // the lock: a storage operation that waits for the check to stop
@@ -608,6 +698,9 @@ impl ManagedTorrent {
                                             return Err(result);
                                         }
                                     }
+                                    // Streams waiting for a piece the check found present
+                                    // won't see it downloaded: let them look again.
+                                    paused.streams.wake_all();
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     // A pause requested after the last piece was checked
@@ -615,6 +708,7 @@ impl ManagedTorrent {
                                     // live behind the caller's back. `g.paused` is the latest
                                     // intent (pause() sets it, start()/unpause clears it).
                                     let start_paused = g.paused;
+                                    let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
@@ -631,6 +725,7 @@ impl ManagedTorrent {
                                         // instead of turning a resume into an error.
                                         debug!("initial check paused, then resumed; restarting it");
                                         let start_paused = g.paused;
+                                        let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                         return _start(
                                             &t,
                                             peer_rx,

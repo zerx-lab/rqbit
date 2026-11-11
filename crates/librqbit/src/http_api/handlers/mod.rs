@@ -77,6 +77,9 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/peer_limit": "Change the torrent's own peer limit. POST json of the form {\"peer_limit\": 50} (null: the session default). Lowering it disconnects nobody",
             "GET /torrents/{id_or_infohash}/file_priorities": "The download priority of every file, 0 (skip) to 7 (maximum): {\"file_priorities\": [1, 0, 7]}",
             "POST /torrents/{id_or_infohash}/file_priorities": "Set the priority of some files, as [file index, priority] pairs: {\"file_priorities\": [[0, 7], [2, 0]]}",
+            "GET /torrents/{id_or_infohash}/web_seeds": "The web seeds (BEP 19) of the torrent: {\"web_seeds\": [{\"url\": ..., \"state\": \"Downloading\", \"downloaded_bytes\": ..., \"last_error\": null}]} (state: Idle, Downloading, BackingOff or Disabled)",
+            "POST /torrents/{id_or_infohash}/web_seeds/add": "Add a web seed (an http or https URL): {\"url\": \"https://example.com/files/\"}",
+            "POST /torrents/{id_or_infohash}/web_seeds/remove": "Remove a web seed: {\"url\": \"https://example.com/files/\"}",
             "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
         },
         "server": "rqbit",
@@ -119,6 +122,10 @@ pub fn make_api_router(state: ApiState) -> Router {
         .route(
             "/torrents/{id}/file_priorities",
             get(torrents::h_torrent_file_priorities),
+        )
+        .route(
+            "/torrents/{id}/web_seeds",
+            get(torrents::h_torrent_web_seeds),
         )
         .route("/torrents/limits", get(configure::h_get_session_ratelimits))
         .route(
@@ -188,6 +195,14 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/{id}/file_priorities",
                 post(torrents::h_torrent_action_set_file_priorities),
+            )
+            .route(
+                "/torrents/{id}/web_seeds/add",
+                post(torrents::h_torrent_action_add_web_seed),
+            )
+            .route(
+                "/torrents/{id}/web_seeds/remove",
+                post(torrents::h_torrent_action_remove_web_seed),
             )
             .route("/torrents/{id}/add_peers", post(torrents::h_add_peers))
             .route("/torrents/create", post(torrents::h_create_torrent));
