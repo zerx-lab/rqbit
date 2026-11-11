@@ -1919,6 +1919,7 @@ impl Session {
                     state: ManagedTorrentState::Initializing(initializing),
                     priorities,
                     piece_picking: opts.piece_picking,
+                    storage_on_loan: false,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,

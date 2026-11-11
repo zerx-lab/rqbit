@@ -124,6 +124,9 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) priorities: Priorities,
     // Kept here, not in the live state, so it survives pause / resume.
     pub(crate) piece_picking: PiecePicking,
+    // Set while a storage operation has the storage out of the state (see `storage_ops`), so
+    // that a stream reading meanwhile waits for it instead of reading from what's left.
+    pub(crate) storage_on_loan: bool,
 }
 
 pub(crate) struct ManagedTorrentOptions {
@@ -640,6 +643,9 @@ impl ManagedTorrent {
                                             return Err(result);
                                         }
                                     }
+                                    // Streams waiting for a piece the check found present
+                                    // won't see it downloaded: let them look again.
+                                    paused.streams.wake_all();
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     // A pause requested after the last piece was checked
