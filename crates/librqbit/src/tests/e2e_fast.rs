@@ -3,8 +3,12 @@
 
 use std::{
     collections::HashSet,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -15,8 +19,8 @@ use super::fake_peer::{
     run, start_client, start_seeder, start_seeder_ext,
 };
 use crate::{
-    UploadSlots,
-    fast::{ALLOWED_FAST_K, MAX_REJECTS_PER_CHOKE, allowed_fast_set},
+    PeerCtx, PeerEvent, PeerPolicy, PeerVerdict, UploadSlots,
+    fast::{ALLOWED_FAST_K, MAX_REJECT_STREAK, MAX_REJECTS_PER_CHOKE, allowed_fast_set},
     tests::test_util::wait_until,
     torrent_state::peer::stats::snapshot::PeerStatsFilter,
 };
@@ -269,8 +273,9 @@ async fn test_fast_choke_rejects_queued_requests() -> anyhow::Result<()> {
     .await
 }
 
-// A request from a choked peer is rejected. A peer that keeps asking while choked gets rejects
-// up to a limit, then its requests are dropped without an answer, and it stays connected.
+// A request from a choked peer is rejected. A peer that keeps asking while choked gets a reject
+// for every request up to a limit (`reqq`), and is disconnected past it: BEP 6 wants every
+// request answered, so nothing is dropped silently.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fast_requests_while_choked_are_rejected_up_to_a_limit() -> anyhow::Result<()> {
     run(async {
@@ -287,25 +292,77 @@ async fn test_fast_requests_while_choked_are_rejected_up_to_a_limit() -> anyhow:
         peer.request(30, 0, BLOCK).await?;
         peer.expect(Wire::RejectRequest(30, 0, BLOCK), STEP).await?;
 
-        let flood: Vec<u8> = (0..MAX_REJECTS_PER_CHOKE + 50)
+        // Exactly the limit, all answered: nothing is dropped.
+        let flood: Vec<u8> = (0..MAX_REJECTS_PER_CHOKE - 1)
             .flat_map(|i| FakePeer::request_frame(31 + i % 8, 0, BLOCK))
             .collect();
         peer.send_raw(&flood).await?;
-        // The unchoke is queued after every answer to the flood.
-        peer.interested().await?;
         let mut rejects = 1;
-        loop {
+        while rejects < MAX_REJECTS_PER_CHOKE {
             match peer.recv(STEP).await {
-                Recv::Msg(Wire::Unchoke) => break,
                 Recv::Msg(Wire::RejectRequest(..)) => rejects += 1,
                 Recv::Msg(Wire::Piece { .. }) => bail!("served a choked peer"),
                 Recv::Msg(_) => {}
-                Recv::Timeout | Recv::Closed => bail!("no unchoke after {rejects} rejects"),
+                Recv::Timeout | Recv::Closed => bail!("only {rejects} rejects"),
             }
         }
-        assert_eq!(rejects, MAX_REJECTS_PER_CHOKE);
+        // One more is not answered: the connection is closed.
+        peer.request(31, 0, BLOCK).await?;
+        loop {
+            match peer.recv(STEP).await {
+                Recv::Msg(Wire::RejectRequest(..)) => bail!("a reject past the limit"),
+                Recv::Msg(_) => {}
+                Recv::Timeout => bail!("still connected past the limit"),
+                Recv::Closed => break,
+            }
+        }
+        Ok(())
+    })
+    .await
+}
 
-        // Still connected, and served now.
+// Right after our choke every request turned down on arrival is rejected, past the limit too:
+// the peer sent them before it saw the choke. It stays connected and is served once unchoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fast_requests_right_after_a_choke_are_all_rejected() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder_ext(
+            SeederOpts {
+                upload_slots: fixed(1),
+                ..Default::default()
+            },
+            SeederExt {
+                pieces: Some(64),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut peer = connect_fast(&seed, b"-FK0001-").await?;
+        peer.bitfield(&[0xff, 0xff, 0, 0, 0, 0, 0, 0]).await?;
+        peer.interested().await?;
+        peer.expect(Wire::Unchoke, STEP).await?;
+        // Not interested any more: the peer loses its slot and is choked.
+        peer.not_interested().await?;
+        peer.expect(Wire::Choke, STEP).await?;
+
+        let flooded = MAX_REJECTS_PER_CHOKE + 50;
+        let flood: Vec<u8> = (0..flooded)
+            .flat_map(|i| FakePeer::request_frame(31 + i % 8, 0, BLOCK))
+            .collect();
+        peer.send_raw(&flood).await?;
+        let mut rejects = 0;
+        while rejects < flooded {
+            match peer.recv(STEP).await {
+                Recv::Msg(Wire::RejectRequest(..)) => rejects += 1,
+                Recv::Msg(Wire::Piece { .. }) => bail!("served a choked peer"),
+                Recv::Msg(_) => {}
+                Recv::Timeout | Recv::Closed => bail!("only {rejects} rejects"),
+            }
+        }
+
+        // Still connected, and served once unchoked again.
+        peer.interested().await?;
+        peer.expect(Wire::Unchoke, STEP).await?;
         peer.request(30, 0, BLOCK).await?;
         let pieces = peer.expect_pieces(1, STEP).await?;
         assert_eq!((pieces[0].0, pieces[0].1), (30, 0));
@@ -415,12 +472,125 @@ async fn test_fast_allowed_fast_set_is_offered_and_served_while_choked() -> anyh
     .await
 }
 
+/// A policy that answers `Choke` to every event once `choke` is set.
+#[derive(Default)]
+struct ChokeSwitch {
+    choke: AtomicBool,
+}
+
+impl PeerPolicy for ChokeSwitch {
+    fn admit(&self, _ip: IpAddr) -> bool {
+        true
+    }
+
+    fn on_event(&self, _ctx: &PeerCtx<'_>, _event: PeerEvent<'_>) -> PeerVerdict {
+        if self.choke.load(Ordering::SeqCst) {
+            PeerVerdict::Choke
+        } else {
+            PeerVerdict::Allow
+        }
+    }
+}
+
+// A policy `Choke` for a peer that holds no upload slot (a newcomer served its allowed-fast
+// pieces while choked) drops the allowed-fast requests that wait behind the upload limit and
+// rejects each of them: nothing more is uploaded, and every request has one answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fast_policy_choke_drops_queued_allowed_fast_requests() -> anyhow::Result<()> {
+    run(async {
+        let policy = Arc::new(ChokeSwitch::default());
+        // One block per second: the first goes out right away, the others wait in the queue.
+        let seed = start_seeder_ext(
+            SeederOpts {
+                upload_bps: Some(BLOCK),
+                ..Default::default()
+            },
+            SeederExt {
+                pieces: Some(64),
+                peer_policy: Some(policy.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let set = allowed_fast_set(Ipv4Addr::LOCALHOST, &seed.info_hash, 64, ALLOWED_FAST_K);
+        let mut peer = connect_fast(&seed, b"-FK0001-").await?;
+        peer.have_none().await?;
+        let mut offered = 0;
+        while offered < set.len() {
+            match peer.recv(STEP).await {
+                Recv::Msg(Wire::AllowedFast(_)) => offered += 1,
+                Recv::Msg(_) => {}
+                Recv::Timeout | Recv::Closed => bail!("offered {offered} pieces only"),
+            }
+        }
+
+        let asked: Vec<Block> = set[..3]
+            .iter()
+            .flat_map(|&piece| [(piece, 0, BLOCK), (piece, BLOCK, BLOCK)])
+            .collect();
+        for &(piece, begin, len) in &asked {
+            peer.request(piece, begin, len).await?;
+        }
+        // The first block goes out right away; then the policy turns against the peer, and the
+        // next event of the connection (a have) carries the verdict.
+        let mut served = peer
+            .expect_pieces(1, STEP)
+            .await?
+            .into_iter()
+            .map(|p| (p.0, p.1, BLOCK))
+            .collect::<Vec<_>>();
+        policy.choke.store(true, Ordering::SeqCst);
+        peer.have(set[0]).await?;
+
+        let mut rejected = Vec::new();
+        while served.len() + rejected.len() < asked.len() {
+            match peer.recv(STEP).await {
+                Recv::Msg(Wire::Piece { index, begin, data }) => {
+                    served.push((index, begin, u32::try_from(data.len())?))
+                }
+                Recv::Msg(Wire::RejectRequest(piece, begin, len)) => {
+                    rejected.push((piece, begin, len))
+                }
+                Recv::Msg(_) => {}
+                Recv::Timeout | Recv::Closed => {
+                    bail!("unanswered: served {served:?}, rejected {rejected:?}")
+                }
+            }
+        }
+        for block in &asked {
+            let answers = served
+                .iter()
+                .chain(&rejected)
+                .filter(|b| *b == block)
+                .count();
+            assert_eq!(
+                answers, 1,
+                "{block:?}: served {served:?}, rejected {rejected:?}"
+            );
+        }
+        // At one block per second at most one more went out before the verdict.
+        assert!(
+            rejected.len() >= asked.len() - 2,
+            "served {served:?}, rejected {rejected:?}"
+        );
+
+        // An allowed-fast request made now is rejected too.
+        let (piece, begin, len) = (set[3], 0, BLOCK);
+        peer.request(piece, begin, len).await?;
+        peer.expect(Wire::RejectRequest(piece, begin, len), STEP)
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------------------------
 // Downloading side
 // ---------------------------------------------------------------------------------------------
 
 // A peer that chokes the client and rejects what it was asked for: the client gives the blocks
-// back and completes the torrent from another peer, without asking the choking one again.
+// back and completes the torrent from another peer, without asking the choking one again. The
+// read timeout is long, so the safety net (half of it) cannot be what gives the blocks back.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fast_rejected_blocks_go_to_another_peer() -> anyhow::Result<()> {
     run(async {
@@ -429,6 +599,7 @@ async fn test_fast_rejected_blocks_go_to_another_peer() -> anyhow::Result<()> {
             &seed,
             ClientOpts {
                 listen: true,
+                read_write_timeout: Some(Duration::from_secs(120)),
                 ..Default::default()
             },
         )
@@ -454,6 +625,140 @@ async fn test_fast_rejected_blocks_go_to_another_peer() -> anyhow::Result<()> {
         assert!(
             msgs.iter().all(|m| !matches!(m, Wire::Request(..))),
             "asked the choking peer again: {msgs:?}"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Rejects every request `peer` receives during `window`, sending a redundant `Unchoke` after
+/// each reject when `unchoke_each` is set. Returns the requests received, or an error when the
+/// connection closed.
+async fn reject_everything(
+    peer: &mut FakePeer,
+    window: Duration,
+    unchoke_each: bool,
+) -> anyhow::Result<usize> {
+    let deadline = Instant::now() + window;
+    let mut asked = 0;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(asked);
+        }
+        match peer.recv(left).await {
+            Recv::Msg(Wire::Request(piece, begin, len)) => {
+                asked += 1;
+                peer.reject(piece, begin, len).await?;
+                if unchoke_each {
+                    peer.unchoke().await?;
+                }
+            }
+            Recv::Msg(_) => {}
+            Recv::Timeout => return Ok(asked),
+            Recv::Closed => bail!("closed after {asked} requests"),
+        }
+    }
+}
+
+/// A client of a torrent with more pieces than the rejected list holds, and a peer that has
+/// all of them and unchokes the client.
+async fn many_pieces_and_an_unchoking_peer() -> anyhow::Result<(Fixture, Fixture, FakePeer)> {
+    let seed = start_seeder_ext(
+        SeederOpts::default(),
+        SeederExt {
+            pieces: Some(80),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let client = start_client(
+        &seed,
+        ClientOpts {
+            listen: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut peer = connect_fast(&client, b"-FK0001-").await?;
+    peer.have_all().await?;
+    peer.unchoke().await?;
+    Ok((seed, client, peer))
+}
+
+// Review scenario A: a peer that unchokes the client and rejects every request, with more
+// pieces than the client remembers rejects of. The client stops asking after a streak of
+// rejects instead of trying piece after piece at round-trip speed, and keeps the connection
+// (the peer may serve later).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fast_rejecting_everything_is_not_a_request_loop() -> anyhow::Result<()> {
+    run(async {
+        let (_seed, client, mut peer) = many_pieces_and_an_unchoking_peer().await?;
+        let asked = reject_everything(&mut peer, Duration::from_secs(3), false).await?;
+        assert!(asked > 0, "nothing was asked");
+        assert!(
+            asked < MAX_REJECT_STREAK as usize,
+            "asked {asked} times in a request/reject loop"
+        );
+        assert_eq!(live_fast_flags(&client), vec![true], "the peer was dropped");
+        Ok(())
+    })
+    .await
+}
+
+// Review scenario B: the same peer sends a redundant `Unchoke` after every reject. Only a real
+// choked-to-unchoked transition forgives rejects, so the loop is not reopened.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fast_redundant_unchokes_do_not_reopen_the_loop() -> anyhow::Result<()> {
+    run(async {
+        let (_seed, client, mut peer) = many_pieces_and_an_unchoking_peer().await?;
+        let asked = reject_everything(&mut peer, Duration::from_secs(3), true).await?;
+        assert!(asked > 0, "nothing was asked");
+        assert!(
+            asked < MAX_REJECT_STREAK as usize,
+            "asked {asked} times in a request/reject loop"
+        );
+        assert_eq!(live_fast_flags(&client), vec![true], "the peer was dropped");
+        Ok(())
+    })
+    .await
+}
+
+// A peer that unchokes the client and rejects everything is useless: a real choke and unchoke
+// end the pause the streak started, but not the streak, and past `MAX_REJECT_STREAK` rejects in
+// a row the client disconnects it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fast_peer_rejecting_everything_is_disconnected() -> anyhow::Result<()> {
+    run(async {
+        let (_seed, _client, mut peer) = many_pieces_and_an_unchoking_peer().await?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut rejected = 0;
+        loop {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "still connected after {rejected} rejects"
+            );
+            match peer.recv(Duration::from_millis(300)).await {
+                Recv::Msg(Wire::Request(piece, begin, len)) => {
+                    // The client closes the connection right after the reject that ends the
+                    // streak, with more requests of it still to be answered here.
+                    if peer.reject(piece, begin, len).await.is_err() {
+                        break;
+                    }
+                    rejected += 1;
+                }
+                Recv::Msg(_) => {}
+                // Paused: a choke and an unchoke make the client ask again.
+                Recv::Timeout => {
+                    peer.choke().await?;
+                    peer.unchoke().await?;
+                }
+                Recv::Closed => break,
+            }
+        }
+        assert!(
+            rejected >= MAX_REJECT_STREAK,
+            "disconnected after {rejected} rejects"
         );
         Ok(())
     })
@@ -523,8 +828,9 @@ async fn test_fast_choke_without_answers_gives_pieces_back_in_time() -> anyhow::
     .await
 }
 
-// A silent peer, not even keep-alives: the safety net gives the pieces back before the read
-// timeout gives up on the peer.
+// A silent peer, not even keep-alives: the safety net gives the pieces back while the peer is
+// still connected (a peer that chokes us is excused for being silent, so without the net the
+// pieces would wait for the silent-peer timeout of minutes).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_fast_choke_and_silence_gives_pieces_back() -> anyhow::Result<()> {
     run(async {
@@ -544,21 +850,31 @@ async fn test_fast_choke_and_silence_gives_pieces_back() -> anyhow::Result<()> {
         silent.have_all().await?;
         silent.unchoke().await?;
         let asked = requests(&mut silent, BLOCKS).await?;
-        let choked_at = Instant::now();
         silent.choke().await?;
 
         let mut other = connect_fast(&client, b"-FK0002-").await?;
         other.have_all().await?;
         other.unchoke().await?;
-        let again = serve_until_complete(&mut other, &seed, &client).await?;
+        let (piece, begin, len) = loop {
+            match other.recv(STEP).await {
+                Recv::Msg(Wire::Request(piece, begin, len)) => break (piece, begin, len),
+                Recv::Msg(_) => {}
+                Recv::Timeout | Recv::Closed => bail!("nothing given back"),
+            }
+        };
+        assert_eq!(
+            live_fast_flags(&client).len(),
+            2,
+            "the pieces came back because the silent peer was dropped"
+        );
+        other
+            .piece(piece, begin, seed.block(piece, begin, len))
+            .await?;
+        let mut again = serve_until_complete(&mut other, &seed, &client).await?;
+        again.insert((piece, begin, len));
         for block in &asked {
             assert!(again.contains(block), "{block:?} was not asked again");
         }
-        assert!(
-            choked_at.elapsed() < read_write_timeout * 3,
-            "completed {:?} after the choke",
-            choked_at.elapsed()
-        );
         Ok(())
     })
     .await
@@ -748,10 +1064,11 @@ async fn test_fast_protocol_errors_close_the_connection() -> anyhow::Result<()> 
 async fn test_fast_two_sessions_download() -> anyhow::Result<()> {
     run(async {
         for (seed_disables, client_disables) in [(false, false), (true, false), (false, true)] {
-            // Slow enough to see the connection live before the download completes.
+            // Slow enough to see the connection live before the download completes: about
+            // seven seconds for the eight blocks.
             let seed = start_seeder_ext(
                 SeederOpts {
-                    upload_bps: Some(4 * BLOCK),
+                    upload_bps: Some(BLOCK),
                     ..Default::default()
                 },
                 SeederExt {
