@@ -50,7 +50,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -306,10 +306,7 @@ impl TorrentStateLive {
                 unflushed_bitv_bytes: 0,
             }),
             files: paused.files,
-            stats: AtomicStats {
-                have_bytes: AtomicU64::new(have_bytes),
-                ..Default::default()
-            },
+            stats: paused.carried_stats.to_atomic(have_bytes),
             lengths: lengths.clone(),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
@@ -937,7 +934,13 @@ impl TorrentStateLive {
             files: self.files.take()?,
             chunk_tracker,
             streams: self.streams.clone(),
+            carried_stats: Default::default(),
         })
+    }
+
+    // The counters so far, for the live state a storage operation restarts the torrent in.
+    pub(crate) fn carried_stats(&self) -> super::paused::CarriedStats {
+        super::paused::CarriedStats::snapshot(&self.stats)
     }
 
     /// Resolves once the have-bitfield writes queued so far have reached storage.

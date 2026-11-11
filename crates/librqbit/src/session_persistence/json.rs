@@ -170,7 +170,8 @@ impl JsonSessionPersistenceStore {
             peer_limit: torrent.peer_limit(),
             file_priorities: Some(torrent.file_priorities()),
             piece_priorities: torrent.piece_priority_overrides(),
-            output_folder: torrent.shared().options.output_folder.clone(),
+            output_folder: torrent.output_folder(),
+            renamed_files: torrent.shared().renamed_files(),
         };
 
         let torrent_bytes = torrent

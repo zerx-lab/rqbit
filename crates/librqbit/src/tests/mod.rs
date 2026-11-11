@@ -12,6 +12,7 @@ mod e2e_port_mapping;
 mod e2e_priorities;
 mod e2e_proxy;
 mod e2e_ratelimits;
+mod e2e_storage_ops;
 mod e2e_stream;
 mod e2e_trackers;
 mod fake_peer;
