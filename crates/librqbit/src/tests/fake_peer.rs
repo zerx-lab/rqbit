@@ -437,6 +437,7 @@ pub(super) async fn start_seeder_ext(opts: SeederOpts, ext: SeederExt) -> anyhow
                     read_write_timeout: opts.read_write_timeout,
                     ..Default::default()
                 }),
+                super_seeding: ext.super_seeding,
                 ..Default::default()
             }),
         )
@@ -470,6 +471,8 @@ pub(super) struct ClientOpts {
     /// Download into this folder instead of a fresh temporary one, e.g. the folder of an
     /// earlier client, to pick up where it stopped.
     pub(super) dir: Option<TempDir>,
+    /// Add the torrent with [`AddTorrentOptions::super_seeding`].
+    pub(super) super_seeding: bool,
 }
 
 /// A client downloading the torrent of `seed` into an empty folder, or into `opts.dir`.
@@ -507,6 +510,7 @@ pub(super) async fn start_client(seed: &Fixture, opts: ClientOpts) -> anyhow::Re
                     read_write_timeout: opts.read_write_timeout,
                     ..Default::default()
                 }),
+                super_seeding: opts.super_seeding,
                 ..Default::default()
             }),
         )
@@ -679,4 +683,6 @@ pub(super) struct SeederExt {
     pub(super) pieces: Option<u32>,
     pub(super) disable_fast_extension: bool,
     pub(super) peer_policy: Option<Arc<dyn PeerPolicy>>,
+    /// Add the torrent with [`AddTorrentOptions::super_seeding`].
+    pub(super) super_seeding: bool,
 }

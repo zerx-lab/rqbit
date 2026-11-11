@@ -15,6 +15,7 @@ mod e2e_proxy;
 mod e2e_ratelimits;
 mod e2e_storage_ops;
 mod e2e_stream;
+mod e2e_super_seeding;
 mod e2e_trackers;
 mod e2e_v2;
 mod e2e_v2_hashes;

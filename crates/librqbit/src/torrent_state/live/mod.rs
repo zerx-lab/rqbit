@@ -43,7 +43,11 @@ pub(crate) mod hashes;
 pub mod peer;
 pub mod peers;
 pub mod stats;
+mod super_seeding;
 mod web_seed;
+
+use self::super_seeding::SuperSeedConn;
+pub(crate) use self::super_seeding::SuperSeeding;
 
 use std::{
     borrow::Cow,
@@ -234,6 +238,8 @@ pub struct TorrentStateLive {
     // Decides which interested peers we upload to.
     choker: Arc<Choker>,
 
+    // Which piece each super seeding (BEP 16) connection is shown.
+    pub(crate) super_seeding: Arc<SuperSeeding>,
     // BEP 52 hash requests: the answers we give, the piece layers we fetch.
     hashes: hashes::HashState,
 }
@@ -335,6 +341,7 @@ impl TorrentStateLive {
                 paused.shared.options.upload_slots,
                 Instant::now(),
             )),
+            super_seeding: Default::default(),
             hashes: hashes::HashState::new(&paused.metadata.info),
         });
 
@@ -606,6 +613,7 @@ impl TorrentStateLive {
             hash_answers: Mutex::new(hashes::AnswerBudget::new(Instant::now())),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
+            super_seed: self.super_seed_conn(checked_peer.addr),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
         let options = PeerConnectionOptions {
@@ -682,6 +690,7 @@ impl TorrentStateLive {
             hash_answers: Mutex::new(hashes::AnswerBudget::new(Instant::now())),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
+            super_seed: state.super_seed_conn(addr),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
@@ -1036,6 +1045,8 @@ impl TorrentStateLive {
                 .store(hns.finished(), Ordering::Release);
             (hns, released)
         };
+        // Super seeding connections end the mode when the selection is no longer complete.
+        self.super_seeding.wake_all();
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
@@ -1420,6 +1431,9 @@ struct PeerHandler {
     hash_answers: Mutex<hashes::AnswerBudget>,
 
     client_name_and_version: String,
+
+    // Super seeding (BEP 16) of this connection. A leaf lock inside.
+    super_seed: SuperSeedConn,
 }
 
 impl PeerConnectionHandler for &'_ PeerHandler {
@@ -1554,6 +1568,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             !self.state.shared.options.disable_fast_extension && handshake.supports_fast(),
         );
         self.state.set_peer_live(self.addr, handshake, ckind, v2);
+        // A super seeding connection waits for the handshake before it waits for the piece set.
+        self.on_bitfield_notify.notify_waiters();
         self.policy.mark_established();
         self.policy_event(PeerEvent::Handshake {
             peer_id,
@@ -1583,9 +1599,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
         // While we still look for peers to download from, a connection that does nothing is
         // only kept for as long as no other peer could use it: neither the torrent's peer limit
-        // nor the session's is reached. Nothing is asked of a peer that chokes us, or that we
-        // pause because it rejected too much (Fast Extension).
-        (they_wait || self.is_choked() || self.fast.lock().is_paused(Instant::now()))
+        // nor the session's is reached. Nothing is asked of a peer that chokes us, that we
+        // pause because it rejected too much (Fast Extension), or that has nothing we need
+        // (until it announces something: a super seeder shows a piece after a while).
+        (they_wait
+            || self.is_choked()
+            || self.fast.lock().is_paused(Instant::now())
+            || !self.peer_is_interesting())
             && self.state.has_room_for_peers()
     }
 
@@ -1609,6 +1629,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_uploaded_chunk(&self, chunk: &ChunkInfo) -> anyhow::Result<()> {
+        self.super_seed.on_uploaded(chunk);
         self.policy_event(PeerEvent::Uploaded {
             piece: chunk.piece_index.get(),
             begin: chunk.offset,
@@ -1688,6 +1709,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         if self.state.torrent().options.disable_upload() {
             return false;
         }
+        // A super seeder pretends to have nothing.
+        if self.super_seed.is_active() {
+            return false;
+        }
 
         self.state.get_approx_have_bytes() > 0
     }
@@ -1696,8 +1721,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // Announce every completed piece, also one the peer's bitfield already claims. Leaving
         // such HAVEs out makes us look like a peer that doesn't report its progress, which
         // anti-leech tools (e.g. PeerBanHelper's ProgressCheatBlocker) take as a cheating
-        // client and ban.
-        !self.state.shared.options.disable_upload()
+        // client and ban. A super seeder only announces the pieces it shows.
+        !self.state.shared.options.disable_upload() && !self.super_seed.is_active()
     }
 
     fn update_my_extended_handshake(
@@ -2115,6 +2140,19 @@ impl PeerHandler {
             }
         };
 
+        if self.super_seed.hides(piece_index) {
+            // As for a piece we do not have, but the peer did nothing wrong: it may have asked
+            // before the mode started, so the connection stays.
+            if self.policy.gate().is_fast() {
+                return self.reject_on_arrival(request);
+            }
+            trace!(
+                ?request,
+                "super seeding: ignoring a request for a piece not shown"
+            );
+            return Ok(());
+        }
+
         if !self
             .state
             .lock_read("is_chunk_ready_to_upload")
@@ -2225,6 +2263,10 @@ impl PeerHandler {
                 }
             });
         self.on_bitfield_notify.notify_waiters();
+        if let Some(piece) = self.state.lengths.validate_piece_index(have) {
+            self.super_seed.on_peer_has(piece);
+            self.state.super_seeding.on_have(self.addr, piece);
+        }
         if have < self.policy.num_pieces() {
             self.policy_event(PeerEvent::Have { piece: have })?;
         }
@@ -2265,10 +2307,18 @@ impl PeerHandler {
             debug!("peer has full torrent");
         }
         let event_bits = self.policy.is_active().then(|| bf.clone());
+        let has_shown = self
+            .super_seed
+            .current_piece()
+            .filter(|p| bf.get(p.get_usize()).is_some_and(|b| *b));
         self.state
             .peers
             .update_bitfield(self.addr, bf, total_pieces);
         self.on_bitfield_notify.notify_waiters();
+        match has_shown {
+            Some(piece) => self.super_seed.on_peer_has(piece),
+            None => self.super_seed.wake(),
+        }
         // After the update: when the policy disconnects the peer for it, the bitfield is the one
         // reported with the disconnect.
         if let Some(bits) = event_bits.as_ref().and_then(|b| b.get(..total_pieces)) {
@@ -2282,7 +2332,8 @@ impl PeerHandler {
     /// its piece set arrived. Decided once per connection.
     fn offer_allowed_fast(&self, peer_pieces: usize) -> anyhow::Result<()> {
         let gate = self.policy.gate();
-        if !gate.is_fast() || gate.allowed_fast_decided() {
+        // A super seeder offers nothing it did not show (libtorrent does the same).
+        if !gate.is_fast() || gate.allowed_fast_decided() || self.super_seed.is_active() {
             return Ok(());
         }
         let offer = self.allowed_fast_offer(gate, peer_pieces)?;
@@ -2503,6 +2554,7 @@ impl PeerHandler {
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
         let handle = self.addr;
+        self.run_super_seeding().await?;
         self.wait_for_bitfield().await;
 
         let mut update_interest = {
@@ -2551,11 +2603,41 @@ impl PeerHandler {
                 }
             }
 
+            // Interested only in a peer that has something for us (BEP 3). A super seeder
+            // (BEP 16) shows its next piece to a peer that is not interested in it, or that
+            // announced the last one: staying interested in a peer that has nothing for us
+            // would leave us waiting for it forever.
+            // Registered before looking, so a change in between is not missed.
+            let peer_announced = self.on_bitfield_notify.notified();
+            let need_changed = self.state.new_pieces_notify.notified();
+            if !self.peer_is_interesting() {
+                update_interest(self, false)?;
+                // Its `Have`s, or a change in what we need, may make it interesting.
+                match aframe!(tokio::time::timeout(
+                    // Half of default rw timeout not to race with it.
+                    Duration::from_secs(5),
+                    async {
+                        tokio::select! {
+                            _ = peer_announced => {}
+                            _ = need_changed => {}
+                        }
+                    }
+                ))
+                .await
+                {
+                    Ok(()) => debug!("woken up, the peer may have something for us"),
+                    Err(_) => trace!("the peer has nothing for us, looking again"),
+                }
+                continue;
+            }
             update_interest(self, true)?;
             aframe!(self.wait_for_request_slot(None)).await;
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
+            // The peer announcing a piece (a super seeder shows its pieces one `Have` at a time)
+            // may give us something to ask it for.
+            let peer_pieces_notify = self.on_bitfield_notify.notified();
             // With the Fast Extension the requester also runs while choked, for allowed-fast
             // pieces. When none of them is left to ask for, the unchoke (or a new allowed-fast
             // piece) has to wake it, not only a piece coming back to the queue.
@@ -2583,6 +2665,7 @@ impl PeerHandler {
                         async {
                             tokio::select! {
                                 _ = new_piece_notify => {}
+                                _ = peer_pieces_notify => {}
                                 _ = slots_changed_notify => {}
                             }
                         }
@@ -3232,6 +3315,30 @@ impl PeerHandler {
         self.state
             .peers
             .with_live(self.addr, |live| live.requested_inflight_count())
+    }
+
+    /// Whether the peer has a piece we still need, or one a stream waits for: the peer we
+    /// are interested in (BEP 3). `false` while its piece set is unknown or the torrent is not
+    /// live.
+    fn peer_is_interesting(&self) -> bool {
+        self.state
+            .peers
+            .with_live(self.addr, |live| {
+                let g = self.state.lock_read("peer_is_interesting");
+                let Ok(chunks) = g.get_chunks() else {
+                    return false;
+                };
+                chunks.has_needed_piece(&live.bitfield)
+                    || self
+                        .state
+                        .streams
+                        .iter_next_pieces(&self.state.lengths)
+                        .any(|p| {
+                            live.bitfield.get(p.get_usize()).is_some_and(|b| *b)
+                                && !chunks.is_piece_have(p)
+                        })
+            })
+            .unwrap_or(false)
     }
 
     fn can_send_request(&self, piece: Option<ValidPieceIndex>) -> bool {

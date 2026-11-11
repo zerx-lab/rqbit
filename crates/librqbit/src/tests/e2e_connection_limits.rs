@@ -728,8 +728,10 @@ async fn test_permits_come_back_on_every_exit_path() -> anyhow::Result<()> {
         drop(p);
         wait_released(&client, &[&a]).await.context("peer closed")?;
 
-        // The read timeout: a peer that unchoked the client, has nothing, and says nothing.
+        // The read timeout: a peer that unchoked the client, has every piece, and answers none
+        // of its requests. (One that has nothing may stay silent until it announces a piece.)
         let mut p = connect(b"-FK0002-").await?;
+        p.bitfield(&[0b1111_0000]).await?;
         p.unchoke().await?;
         p.expect_closed(Duration::from_secs(15)).await?;
         wait_released(&client, &[&a])

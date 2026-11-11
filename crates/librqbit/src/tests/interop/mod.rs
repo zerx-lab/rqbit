@@ -33,6 +33,7 @@ mod dht;
 mod fast_extension;
 mod priorities;
 mod smoke;
+mod super_seeding;
 mod trackers;
 mod webseed;
 
