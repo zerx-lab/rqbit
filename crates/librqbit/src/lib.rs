@@ -95,6 +95,9 @@ pub use choker::UploadSlots;
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
+pub use librqbit_upnp::{
+    PortMappingMethod, PortMappingOptions, PortMappingProtocol, PortMappingState, PortMappingStatus,
+};
 pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::MseMode;
 pub use peer_connection::{PeerBackoffConfig, PeerConnectionOptions};
