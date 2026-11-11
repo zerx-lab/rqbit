@@ -302,6 +302,14 @@ impl Client {
             .live()
             .map_or(0, |l| l.stats_snapshot().downloaded_and_checked_pieces)
     }
+
+    /// Points the live torrent at a peer, as if a tracker had just announced it.
+    fn connect(&self, addr: SocketAddr) -> anyhow::Result<()> {
+        let live = self.handle.live().context("not live")?;
+        live.add_peer_if_not_seen(addr)
+            .context("error adding the peer")?;
+        Ok(())
+    }
 }
 
 async fn add(
@@ -526,13 +534,18 @@ async fn test_web_seed_and_peer_together() -> anyhow::Result<()> {
 
         let seed = only_seed(&client.handle)?;
         assert!(seed.downloaded_bytes > 0, "the web seed gave nothing");
-        assert!(seeder.uploaded() > 0, "the peer gave nothing");
+        // The seeder counts a block once it is written to the socket, which can be after
+        // the client has it: wait for the counter instead of reading it right away.
+        until("the peer's upload is counted", || seeder.uploaded() > 0).await?;
         // No piece was completed twice, none failed.
         assert_eq!(client.checked_pieces(), torrent.pieces);
         assert_eq!(seed.last_error, None);
         // Whole pieces only went to one of them, and the web seed only delivered what was
         // written: together they cover the torrent.
-        assert!(seed.downloaded_bytes + seeder.uploaded() >= torrent.content_len());
+        until("the web seed and the peer cover the torrent", || {
+            seed.downloaded_bytes + seeder.uploaded() >= torrent.content_len()
+        })
+        .await?;
         client.session.stop().await;
         seeder.session.stop().await;
         Ok(())
@@ -544,14 +557,15 @@ async fn test_web_seed_and_peer_together() -> anyhow::Result<()> {
 async fn test_corrupt_web_seed_is_disabled_and_the_peer_fills_in() -> anyhow::Result<()> {
     run(async {
         let torrent = single_file("corrupt.bin", 16 * PIECE, &[]);
-        let seeder = Seeder::start(&torrent, bps(64 * KIB)).await?;
+        let seeder = Seeder::start(&torrent, None).await?;
         let server = WebSeedServer::start(torrent.server_files()).await?;
         let path = torrent.url_path(0);
         server.set(|b| b.corrupt = vec![(path.clone(), 0..torrent.content_len())]);
+        // The web seed alone first: a peer that is there from the start can take every
+        // piece before the web seed gets any.
         let client = Client::start(
             &torrent,
             AddTorrentOptions {
-                initial_peers: Some(vec![seeder.addr]),
                 web_seeds: Some(vec![server.url()]),
                 ..Default::default()
             },
@@ -561,6 +575,8 @@ async fn test_corrupt_web_seed_is_disabled_and_the_peer_fills_in() -> anyhow::Re
             only_seed(&client.handle).is_ok_and(|s| s.state == WebSeedState::Disabled)
         })
         .await?;
+        assert_eq!(client.checked_pieces(), 0);
+        client.connect(seeder.addr)?;
         wait_completed(&client.handle).await?;
         torrent.check_files(&client.out)?;
 
@@ -569,7 +585,10 @@ async fn test_corrupt_web_seed_is_disabled_and_the_peer_fills_in() -> anyhow::Re
         let error = seed.last_error.context("no error")?;
         assert!(error.contains("hash check"), "{error}");
         assert_eq!(client.checked_pieces(), torrent.pieces);
-        assert!(seeder.uploaded() >= torrent.content_len());
+        until("the peer's upload is counted", || {
+            seeder.uploaded() >= torrent.content_len()
+        })
+        .await?;
         client.session.stop().await;
         seeder.session.stop().await;
         Ok(())
@@ -713,32 +732,42 @@ async fn test_missing_file_comes_from_the_peer() -> anyhow::Result<()> {
             ],
             &[],
         );
-        // Slow enough that the web seed, which waits a little after the 404, still has
-        // pieces of the files after the missing one left to fetch.
-        let seeder = Seeder::start(&torrent, bps(16 * KIB)).await?;
+        let seeder = Seeder::start(&torrent, None).await?;
         let server = WebSeedServer::start(torrent.server_files()).await?;
         let missing = torrent.url_path(1);
         server.set(|b| b.missing = vec![missing.clone()]);
+        // The web seed alone first, so that it does get to the missing file: a peer that is
+        // there from the start can take those pieces before the web seed reaches them.
         let client = Client::start(
             &torrent,
             AddTorrentOptions {
-                initial_peers: Some(vec![seeder.addr]),
                 web_seeds: Some(vec![server.url()]),
                 ..Default::default()
             },
         )
         .await?;
+        // The 404 does not stop the web seed: it serves the files on both sides.
+        let served = 16;
+        until("the web seed served the other files", || {
+            client.checked_pieces() == served
+        })
+        .await?;
+        client.connect(seeder.addr)?;
         wait_completed(&client.handle).await?;
         torrent.check_files(&client.out)?;
 
         let seed = only_seed(&client.handle)?;
         assert_ne!(seed.state, WebSeedState::Disabled, "{seed:?}");
+        assert_eq!(seed.downloaded_bytes, served * PIECE as u64);
         assert!(server.served(&torrent.url_path(0), 206) > 0);
         assert!(server.served(&torrent.url_path(2), 206) > 0);
         assert!(server.served(&missing, 206) == 0);
         // Once known missing, the file is not asked for again.
         assert_eq!(server.served(&missing, 404), 1);
-        assert!(seeder.uploaded() >= 2 * PIECE as u64);
+        until("the peer's upload is counted", || {
+            seeder.uploaded() >= 2 * PIECE as u64
+        })
+        .await?;
         client.session.stop().await;
         seeder.session.stop().await;
         Ok(())
