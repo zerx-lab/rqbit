@@ -31,6 +31,7 @@ mod dht;
 mod priorities;
 mod smoke;
 mod trackers;
+mod webseed;
 
 /// The environment variable that points at a Python interpreter with `libtorrent` installed.
 pub(super) const PYTHON_ENV: &str = "RQBIT_TEST_LIBTORRENT_PYTHON";
