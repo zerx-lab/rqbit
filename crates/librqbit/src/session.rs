@@ -1093,6 +1093,26 @@ impl Session {
                 });
             }
 
+            if let Some(i2p) = session.i2p.clone() {
+                session.spawn(
+                    debug_span!(parent: session.rs(), "i2p_reannounce"),
+                    "i2p_reannounce",
+                    {
+                        let this = Arc::downgrade(&session);
+                        async move {
+                            let mut created = i2p.sessions_created();
+                            while created.changed().await.is_ok() {
+                                let Some(this) = this.upgrade() else {
+                                    break;
+                                };
+                                this.reannounce_i2p_torrents();
+                            }
+                            Ok(())
+                        }
+                    },
+                );
+            }
+
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
                     let max_pending_incoming_handshake_checks =
@@ -2324,6 +2344,7 @@ impl Session {
     // Get a peer stream from both DHT and trackers. A hybrid torrent lives in two swarms, so
     // it is announced and looked up under both `info_hash` and its truncated v2 hash (`alt`,
     // with the trackers that announce that hash), and the peers of both feed the same stream.
+    #[allow(clippy::too_many_arguments)]
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -2366,7 +2387,9 @@ impl Session {
             None
         } else {
             self.dht.as_ref().map(|dht| {
-                dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                crate::i2p::clearnet_peers(
+                    dht.get_peers(info_hash, if announce { self.announce_port } else { None }),
+                )
             })
         };
 
@@ -2374,7 +2397,9 @@ impl Session {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
-                lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                crate::i2p::clearnet_peers(
+                    lsd.announce(info_hash, if announce { self.announce_port } else { None }),
+                )
             })
         };
 
@@ -2987,6 +3012,29 @@ impl Session {
     /// address, and when the session has no I2P.
     pub fn i2p_destination(&self, addr: SocketAddr) -> Option<String> {
         self.i2p.as_ref()?.b32_name(&addr)
+    }
+
+    /// Announces the running I2P torrents again: a new SAM session has a new destination,
+    /// which their trackers must learn, and the announces that failed while the bridge was
+    /// unreachable are retried at once instead of after their backoff.
+    fn reannounce_i2p_torrents(&self) {
+        let torrents: Vec<_> = self
+            .db
+            .read()
+            .torrents
+            .values()
+            .filter(|t| matches!(t.shared().net, TorrentNet::I2p { .. }))
+            .cloned()
+            .collect();
+        for t in torrents {
+            let shared = t.shared();
+            for comms in std::iter::once(&shared.tracker_comms).chain(&shared.alt_tracker_comms) {
+                // A torrent that is not running does not announce; it will when it starts.
+                if let Err(e) = comms.reannounce() {
+                    debug!(id = t.id(), "not reannouncing: {e:#}");
+                }
+            }
+        }
     }
 
     /// Where the router port mappings of the session stand: one row per `(protocol, internal
