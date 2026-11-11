@@ -96,6 +96,9 @@ pub use choker::UploadSlots;
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
+/// The uTP implementation, re-exported so that [`ListenerOptions::utp_opts`] can be filled in
+/// (congestion control, buffer sizes) without depending on the crate directly.
+pub use librqbit_utp as utp;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::MseMode;
 pub use peer_connection::{PeerBackoffConfig, PeerConnectionOptions};
