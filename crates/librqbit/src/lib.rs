@@ -24,6 +24,8 @@
 //!
 
 #![warn(clippy::cast_possible_truncation)]
+// The `serde_json::json!` listing of the HTTP API endpoints needs more than the default.
+#![recursion_limit = "256"]
 
 macro_rules! aframe {
     ($e:expr) => {{
@@ -51,6 +53,7 @@ mod connection_limit;
 mod create_torrent_file;
 mod dht_utils;
 mod error;
+mod fast;
 pub mod file_info;
 mod file_ops;
 #[cfg(feature = "http-api")]
@@ -89,6 +92,7 @@ pub mod upnp_server_adapter;
 mod vectored_traits;
 #[cfg(feature = "watch")]
 pub mod watch;
+mod webseed;
 
 pub use error::{Error, Result};
 
@@ -114,6 +118,7 @@ pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DEFAULT_PEER_LIMIT, DhtSessionConfig,
     ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
+pub use storage::MoveStorageMode;
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
@@ -121,11 +126,15 @@ pub use torrent_state::{
 };
 pub use tracker_comms::{TrackerAnnounceOptions, TrackerState, TrackerStats};
 pub use type_aliases::FileInfos;
+pub use webseed::{WebSeedState, WebSeedStats};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
+/// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
+/// checked (and shown without its password) before a session is created with it.
+pub use librqbit_core::proxy::{ProxyConfig, ProxyKind, ProxyUrlError};
 pub use librqbit_core::torrent_metainfo::*;
 
 #[cfg(test)]
