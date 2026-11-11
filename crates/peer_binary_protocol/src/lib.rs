@@ -273,6 +273,17 @@ pub struct HashRequest {
 }
 
 impl HashRequest {
+    /// The geometry of the request, to check it with
+    /// [`librqbit_core::merkle::HashRequestShape::is_valid_for`].
+    pub fn shape(&self) -> librqbit_core::merkle::HashRequestShape {
+        librqbit_core::merkle::HashRequestShape {
+            base: self.base_layer,
+            index: self.index,
+            count: self.length,
+            proof_layers: self.proof_layers,
+        }
+    }
+
     fn serialize_unchecked_len(&self, buf: &mut [u8]) -> usize {
         buf[0..32].copy_from_slice(&self.pieces_root.0);
         BE::write_u32(&mut buf[32..36], self.base_layer);
@@ -1230,12 +1241,14 @@ mod tests {
 
     #[test]
     fn test_hash_messages_round_trip() {
-        assert_round_trip(&hash_request_wire(21, &[]), |m| {
-            matches!(m, Message::HashRequest(r) if *r == HR)
-        });
-        assert_round_trip(&hash_request_wire(23, &[]), |m| {
-            matches!(m, Message::HashReject(r) if *r == HR)
-        });
+        assert_round_trip(
+            &hash_request_wire(21, &[]),
+            |m| matches!(m, Message::HashRequest(r) if *r == HR),
+        );
+        assert_round_trip(
+            &hash_request_wire(23, &[]),
+            |m| matches!(m, Message::HashReject(r) if *r == HR),
+        );
         // Hashes need a contiguous buffer, so only split before the hashes or after them.
         let hashes: Vec<u8> = (0..64u8).collect();
         let wire = hash_request_wire(22, &hashes);

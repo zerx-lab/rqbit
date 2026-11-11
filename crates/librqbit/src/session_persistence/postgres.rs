@@ -294,10 +294,17 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
         let (pieces, levels) = piece_priority_columns(torrent);
+        // The torrent bytes change when BEP 52 piece layers are learned from peers.
+        let torrent_bytes = torrent
+            .metadata
+            .load()
+            .as_ref()
+            .map(|i| i.torrent_bytes.clone())
+            .unwrap_or_default();
         // The output folder changes with Session::move_storage, the file paths with
         // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, web_seeds = $13, move_in_progress = $14 WHERE id = $15",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, web_seeds = $13, move_in_progress = $14, torrent_bytes = CASE WHEN length($15) > 0 THEN $15 ELSE torrent_bytes END WHERE id = $16",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -323,6 +330,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(levels)
         .bind(torrent.web_seed_urls())
         .bind(move_in_progress_column(torrent)?)
+        .bind(torrent_bytes.as_ref())
         .bind::<i32>(id.try_into()?)
         .execute(&self.pool)
         .await

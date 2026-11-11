@@ -297,6 +297,8 @@ pub(crate) struct LivePeerState {
 
     // Both handshakes carried the Fast Extension bit (BEP 6).
     pub fast_extension: bool,
+    // Both handshakes carried the BitTorrent v2 bit (BEP 52): hashes may be asked of it.
+    pub v2: bool,
 }
 
 impl LivePeerState {
@@ -319,6 +321,7 @@ impl LivePeerState {
             tx,
             connection_kind,
             fast_extension: false,
+            v2: false,
         }
     }
 

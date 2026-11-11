@@ -16,7 +16,7 @@ use librqbit_core::{
 };
 use parking_lot::RwLock;
 use peer_binary_protocol::{
-    Handshake, MAX_MSG_LEN, Message,
+    Handshake, Hashes, MAX_MSG_LEN, Message,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -86,6 +86,8 @@ pub enum WriterRequest {
     Message(Message<'static>),
     UtMetadata(UtMetadata<ByteBufOwned>),
     UtPex(UtPex<ByteBufOwned>),
+    /// BEP 52: the answer to a hash request (the borrowed form cannot be `'static`).
+    Hashes(Hashes<ByteBufOwned>),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
 }
@@ -199,6 +201,8 @@ struct ManagePeerArgs {
     handshake_supports_extended: bool,
     // Both handshakes carried the Fast Extension bit (BEP 6).
     fast: bool,
+    // Both handshakes carried the BitTorrent v2 bit (BEP 52): the hash messages may be used.
+    v2: bool,
     read_buf: ReadBuf,
     write_buf: Box<[u8; MAX_MSG_LEN]>,
     read: BoxAsyncReadVectored,
@@ -393,6 +397,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // What the peer supports is in the peer's handshake, not in ours.
         let handshake_supports_extended = incoming.handshake.supports_extended();
         let fast = !self.options.disable_fast_extension && incoming.handshake.supports_fast();
+        let v2 = self.v2 && incoming.handshake.supports_v2();
 
         self.handler
             .on_handshake(incoming.handshake, incoming.kind)
@@ -401,6 +406,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
             fast,
+            v2,
             read_buf: incoming.read_buf,
             write_buf,
             read: incoming.reader,
@@ -441,6 +447,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         async move {
             let handshake_supports_extended = handshake.supports_extended();
             let fast = !self.options.disable_fast_extension && handshake.supports_fast();
+            let v2 = self.v2 && handshake.supports_v2();
             self.handler
                 .on_handshake(handshake, ckind)
                 .map_err(Error::Anyhow)?;
@@ -448,6 +455,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
                 fast,
+                v2,
                 read_buf,
                 write_buf,
                 read,
@@ -555,6 +563,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let ManagePeerArgs {
             handshake_supports_extended,
             fast,
+            v2,
             mut read_buf,
             mut write_buf,
             mut read,
@@ -682,6 +691,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
                             .serialize(&mut *write_buf, ext_msg_ids)?
                     }
+                    WriterRequest::Hashes(hashes) => Message::Hashes(hashes.as_borrowed())
+                        .serialize(&mut *write_buf, ext_msg_ids)?,
                     WriterRequest::ReadChunkRequest(chunk) => {
                         if !self.handler.should_upload_chunk(&chunk) {
                             continue;
@@ -799,6 +810,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 if !fast && message.is_fast_extension() {
                     return Err(Error::DisconnectWithSource(anyhow::anyhow!(
                         "peer sent {message:?}, but the Fast Extension was not negotiated"
+                    )));
+                }
+                if !v2 && message.is_v2() {
+                    return Err(Error::DisconnectWithSource(anyhow::anyhow!(
+                        "peer sent {message:?}, but BitTorrent v2 was not negotiated"
                     )));
                 }
                 if fast {
