@@ -70,7 +70,7 @@ async fn serve(session: &Arc<Session>, read_only: bool) -> anyhow::Result<Served
     let server = tokio::spawn(http.make_http_api_and_run(listener, None));
     Ok(Served {
         base: format!("http://{addr}"),
-        client: reqwest::Client::new(),
+        client: crate::http_client::client_builder().build()?,
         server,
     })
 }
