@@ -28,6 +28,7 @@ use tokio::{
 };
 
 mod dht;
+mod fast_extension;
 mod priorities;
 mod smoke;
 mod trackers;

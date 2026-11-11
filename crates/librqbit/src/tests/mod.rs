@@ -2,6 +2,7 @@ mod e2e;
 mod e2e_another_local_client;
 mod e2e_choking;
 mod e2e_connection_limits;
+mod e2e_fast;
 mod e2e_fastresume_flush;
 mod e2e_have;
 mod e2e_init_pause;

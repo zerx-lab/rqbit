@@ -602,6 +602,9 @@ pub struct SessionOptions {
     /// Decides which peers may connect and what each connection may do, see [`PeerPolicy`].
     /// `None` (the default) means every peer is welcome.
     pub peer_policy: Option<Arc<dyn PeerPolicy>>,
+    /// Do not advertise the Fast Extension (BEP 6). Default off: handshakes set the bit, and a
+    /// connection uses Fast when the peer set it too.
+    pub disable_fast_extension: bool,
 }
 
 impl Default for SessionOptions {
@@ -636,6 +639,7 @@ impl Default for SessionOptions {
             mse_mode: MseMode::default(),
             peer_backoff: None,
             peer_policy: None,
+            disable_fast_extension: false,
         }
     }
 }
@@ -813,6 +817,9 @@ impl Session {
             // connections (including magnet metadata reads), regardless of any
             // per-connection PeerConnectionOptions.
             peer_opts.mse_mode = opts.mse_mode;
+            // Like MSE, Fast is a session-wide decision: every handshake we send, including
+            // magnet metadata reads, advertises it unless the session turned it off.
+            peer_opts.disable_fast_extension = opts.disable_fast_extension;
 
             async fn persistence_factory(
                 opts: &SessionOptions,
@@ -1399,6 +1406,7 @@ impl Session {
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
+            disable_fast_extension: self.peer_opts.disable_fast_extension,
         }
     }
 
@@ -1846,6 +1854,7 @@ impl Session {
                     connect_rate: peer_opts.connect_rate,
                     peer_backoff: self.peer_backoff.clone(),
                     peer_max_request_window: peer_opts.max_request_window,
+                    disable_fast_extension: peer_opts.disable_fast_extension,
                     allow_overwrite: opts.overwrite,
                     ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),

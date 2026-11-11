@@ -342,6 +342,45 @@ impl PieceTracker {
         count
     }
 
+    /// Moves one piece from IN_FLIGHT back to QUEUED if the peer owns it. Returns whether it
+    /// did: the piece may have been completed or stolen meanwhile.
+    pub fn release_piece_owned_by(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        if self
+            .inflight
+            .get(&piece)
+            .is_none_or(|info| info.peer != peer)
+        {
+            return false;
+        }
+        self.inflight.remove(&piece);
+        self.chunks.mark_piece_broken_if_not_have(piece);
+        true
+    }
+
+    /// The pieces the peer owns, i.e. that are in flight to it.
+    pub fn pieces_owned_by(&self, peer: PeerHandle) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.inflight
+            .iter()
+            .filter(move |(_, info)| info.peer == peer)
+            .map(|(p, _)| *p)
+    }
+
+    /// Reserves a queued piece for the peer without asking the picker, e.g. a piece the peer
+    /// suggested. Returns false, and changes nothing, when the piece is not queued (had, not
+    /// wanted, or in flight already).
+    pub fn reserve_queued(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        if !self
+            .chunks
+            .queued_pieces()
+            .get(piece.get_usize())
+            .is_some_and(|b| *b)
+        {
+            return false;
+        }
+        self.reserve_piece(piece, peer, false);
+        true
+    }
+
     // === QUERIES ===
 
     /// Get the inflight info for a piece, if it's currently being downloaded.
@@ -1184,5 +1223,25 @@ mod tests {
             vec![(1, peer(2))]
         );
         assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer(1));
+    }
+
+    #[test]
+    fn test_reserve_queued_takes_only_queued_pieces_and_not_for_a_stream() {
+        // Piece 2 is not wanted at all.
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[1, 1, 0]));
+        let lengths = tracker.chunks.get_lengths().clone();
+        let piece = |i| lengths.validate_piece_index(i).unwrap();
+
+        assert!(tracker.reserve_queued(piece(1), peer(1)));
+        let info = tracker.get_inflight(piece(1)).unwrap();
+        assert_eq!(info.peer, peer(1));
+        // A suggestion is not a stream: priority changes may still release it.
+        assert!(!info.streamed);
+
+        // In flight already, so another peer does not get it, and the owner does not change.
+        assert!(!tracker.reserve_queued(piece(1), peer(2)));
+        assert_eq!(tracker.get_inflight(piece(1)).unwrap().peer, peer(1));
+        assert!(!tracker.reserve_queued(piece(2), peer(1)));
+        assert!(tracker.get_inflight(piece(2)).is_none());
     }
 }
