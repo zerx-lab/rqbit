@@ -70,6 +70,7 @@ mod peer_info_reader;
 mod peer_policy;
 mod piece_picker;
 mod piece_tracker;
+mod priority;
 mod read_buf;
 mod session;
 mod session_persistence;
@@ -107,6 +108,7 @@ pub use mse::MseMode;
 pub use peer_connection::{PeerBackoffConfig, PeerConnectionOptions};
 pub use peer_policy::{DEFAULT_THROTTLED_UPLOAD_BPS, PeerCtx, PeerEvent, PeerPolicy, PeerVerdict};
 pub use piece_picker::PiecePicking;
+pub use priority::Priority;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DEFAULT_PEER_LIMIT, DhtSessionConfig,
     ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,

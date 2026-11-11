@@ -28,6 +28,7 @@ pub struct SerializedTorrent {
     torrent_bytes: Bytes,
     trackers: HashSet<String>,
     output_folder: PathBuf,
+    // The files with a non-zero priority, kept for readers that predate `file_priorities`.
     only_files: Option<Vec<usize>>,
     is_paused: bool,
     #[serde(default)]
@@ -38,6 +39,13 @@ pub struct SerializedTorrent {
     // The torrent's own peer limit; `None` (and older state): the session default.
     #[serde(default)]
     peer_limit: Option<usize>,
+    // The priority of every file. Missing in state written before priorities: then the files of
+    // `only_files` are normal and the others 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_priorities: Option<Vec<u8>>,
+    // Explicit piece priorities, (piece index, level).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    piece_priorities: Vec<(u32, u8)>,
 }
 
 impl SerializedTorrent {
@@ -69,6 +77,8 @@ impl SerializedTorrent {
             piece_picking: self.piece_picking,
             ratelimits: self.ratelimits,
             peer_limit: self.peer_limit,
+            file_priorities: self.file_priorities,
+            piece_priorities: (!self.piece_priorities.is_empty()).then_some(self.piece_priorities),
             overwrite: true,
             ..Default::default()
         };

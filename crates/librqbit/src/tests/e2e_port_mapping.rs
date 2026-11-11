@@ -39,6 +39,7 @@ async fn session_maps_tcp_utp_and_dht_ports_and_deletes_them_on_stop() -> anyhow
                 bootstrap_addrs: Some(vec![silent_node.local_addr()?.to_string()]),
                 port: None,
                 persistence: None,
+                enforce_node_id: false,
             }),
             persistence: None,
             listen: Some(ListenerOptions {

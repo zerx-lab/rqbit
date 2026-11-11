@@ -29,6 +29,7 @@ use crate::{
     mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
     peer_policy::{PeerPolicy, ThrottledUpload, canonical_ip},
+    priority::Priorities,
     read_buf::ReadBuf,
     session_persistence::{SessionPersistenceStore, json::JsonSessionPersistenceStore},
     session_stats::SessionStats,
@@ -337,6 +338,21 @@ pub struct AddTorrentOptions {
     /// Can be changed later with [`Session::set_piece_picking`].
     #[serde(default)]
     pub piece_picking: PiecePicking,
+
+    /// The download priority of each file, by file index, in `0..=7` (see [`crate::Priority`]):
+    /// 0 is not downloaded, 1 normal, 6 high, 7 maximum. Files past the end of the list are
+    /// normal; a list longer than the torrent's files, or a level above 7, is an error.
+    ///
+    /// With `only_files` / `only_files_regex` as well, the files they leave out are 0 and the
+    /// files they select take their level from here, a 0 counting as normal (the file was
+    /// selected). Can be changed later with [`Session::set_file_priorities`].
+    #[serde(default)]
+    pub file_priorities: Option<Vec<u8>>,
+
+    /// Explicit priorities of single pieces, `(piece index, level)`, overriding the level the
+    /// piece gets from its files. Can be changed later with [`Session::set_piece_priorities`].
+    #[serde(default)]
+    pub piece_priorities: Option<Vec<(u32, u8)>>,
 }
 
 pub struct ListOnlyResponse {
@@ -1588,6 +1604,15 @@ impl Session {
             }));
         }
 
+        let priorities = Priorities::from_options(
+            &metadata.file_infos,
+            metadata.lengths().total_pieces(),
+            only_files.as_deref(),
+            opts.file_priorities.as_deref(),
+            opts.piece_priorities.as_deref(),
+        )
+        .context("invalid priorities")?;
+
         let storage_factory = opts
             .storage_factory
             .take()
@@ -1668,7 +1693,7 @@ impl Session {
             let initializing = Arc::new(TorrentStateInitializing::new(
                 minfo.clone(),
                 metadata.clone(),
-                only_files.clone(),
+                priorities.clone(),
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
                 false,
@@ -1677,7 +1702,7 @@ impl Session {
                 locked: RwLock::new(ManagedTorrentLocked {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
-                    only_files,
+                    priorities,
                     piece_picking: opts.piece_picking,
                 }),
                 state_change_notify: Notify::new(),
@@ -1922,6 +1947,33 @@ impl Session {
         only_files: &HashSet<usize>,
     ) -> anyhow::Result<()> {
         handle.update_only_files(only_files)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Sets the download priority of some files, `(file index, level)`, in any state: 0 is not
+    /// downloaded, 1 normal, 6 high, 7 maximum (see [`crate::Priority`]). A live torrent asks
+    /// for the new order from its next request on, and cancels the requests of pieces no file
+    /// wants any more. An unknown file index or a level above 7 is an error and changes nothing.
+    pub async fn set_file_priorities(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        priorities: &[(usize, u8)],
+    ) -> anyhow::Result<()> {
+        handle.set_file_priorities(priorities)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Sets (`Some(level)`) or clears (`None`) an explicit priority of single pieces, `(piece
+    /// index, level)`, in any state. The explicit level wins over the one the piece gets from its
+    /// files. An unknown piece index or a level above 7 is an error and changes nothing.
+    pub async fn set_piece_priorities(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        priorities: &[(u32, Option<u8>)],
+    ) -> anyhow::Result<()> {
+        handle.set_piece_priorities(priorities)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
