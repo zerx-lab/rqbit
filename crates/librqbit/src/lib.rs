@@ -88,6 +88,7 @@ pub mod upnp_server_adapter;
 mod vectored_traits;
 #[cfg(feature = "watch")]
 pub mod watch;
+mod webseed;
 
 pub use error::{Error, Result};
 
@@ -120,6 +121,7 @@ pub use torrent_state::{
 };
 pub use tracker_comms::{TrackerAnnounceOptions, TrackerState, TrackerStats};
 pub use type_aliases::FileInfos;
+pub use webseed::{WebSeedState, WebSeedStats};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

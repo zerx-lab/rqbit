@@ -37,6 +37,8 @@ struct TorrentsTableRecord {
     // Explicit piece priorities as two parallel arrays: piece index and level.
     piece_priority_pieces: Vec<i64>,
     piece_priority_levels: Vec<i16>,
+    // NULL in rows written before web seeds: the torrent's own are used.
+    web_seeds: Option<Vec<String>>,
 }
 
 // NULL is unlimited, and so is a value that does not fit (the column is wider than the rate).
@@ -89,6 +91,7 @@ impl TorrentsTableRecord {
                     .zip(self.piece_priority_levels)
                     .filter_map(|(p, l)| Some((u32::try_from(p).ok()?, u8::try_from(l).ok()?)))
                     .collect(),
+                web_seeds: self.web_seeds,
             },
         ))
     }
@@ -144,6 +147,7 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_levels SMALLINT[] NOT NULL DEFAULT '{}'"
         );
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS web_seeds TEXT[]");
 
         Ok(Self { pool })
     }
@@ -166,8 +170,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, web_seeds)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
@@ -207,6 +211,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(file_priority_column(torrent))
             .bind(pieces)
             .bind(levels)
+            .bind(torrent.web_seed_urls())
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -242,7 +247,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         let ratelimits = torrent.ratelimits();
         let (pieces, levels) = piece_priority_columns(torrent);
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, upload_bps = $5, download_bps = $6, peer_limit = $7, file_priorities = $8, piece_priority_pieces = $9, piece_priority_levels = $10 WHERE id = $11",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, upload_bps = $5, download_bps = $6, peer_limit = $7, file_priorities = $8, piece_priority_pieces = $9, piece_priority_levels = $10, web_seeds = $11 WHERE id = $12",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -258,6 +263,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(file_priority_column(torrent))
         .bind(pieces)
         .bind(levels)
+        .bind(torrent.web_seed_urls())
         .bind::<i32>(id.try_into()?)
             .execute(&self.pool)
             .await
