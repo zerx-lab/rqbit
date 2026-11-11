@@ -415,7 +415,8 @@ mod tests {
             info: bencode::WithRawBytes {
                 data: TorrentMetaV1Info {
                     name: name.map(|n| n.as_bytes().into()),
-                    pieces: b""[..].into(),
+                    name_utf8: None,
+                    pieces: Some(b""[..].into()),
                     piece_length: 1,
                     length: None,
                     md5sum: None,
@@ -425,6 +426,7 @@ mod tests {
                             .map(|f| TorrentMetaV1File {
                                 length: 1,
                                 path: f.split("/").map(|f| f.as_bytes().into()).collect(),
+                                path_utf8: None,
                                 attr: None,
                                 sha1: None,
                                 symlink_path: None,
@@ -435,6 +437,8 @@ mod tests {
                     sha1: None,
                     symlink_path: None,
                     private: false,
+                    meta_version: None,
+                    file_tree: None,
                 },
                 raw_bytes: Default::default(),
             },
@@ -445,6 +449,9 @@ mod tests {
             publisher_url: None,
             creation_date: None,
             info_hash: Id20::default(),
+            info_hash_v2: None,
+            piece_layers: None,
+            url_list: Vec::new(),
         }
     }
 
@@ -452,7 +459,7 @@ mod tests {
         t: &TorrentMetaV1Owned,
         renamed: &[(usize, &str)],
     ) -> anyhow::Result<TorrentFileTree> {
-        let info = t.info.data.validate()?;
+        let info = t.info.data.clone().validate()?;
         let renamed = renamed
             .iter()
             .map(|(idx, path)| (*idx, PathBuf::from(path)))

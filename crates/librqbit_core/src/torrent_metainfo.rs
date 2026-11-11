@@ -185,6 +185,14 @@ impl<BufType: AsRef<[u8]> + Clone> TorrentMetaV1<BufType> {
 pub struct TorrentMetaV1Info<BufType> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<BufType>,
+    /// `name.utf-8`: the name in UTF-8, set by some clients next to a `name` in a legacy
+    /// encoding. Not used for file names on disk; web seed URLs prefer it, like libtorrent.
+    #[serde(
+        rename = "name.utf-8",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name_utf8: Option<BufType>,
     /// SHA-1 hashes of the pieces. Absent in v2-only torrents.
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
     pub pieces: Option<BufType>,
@@ -980,6 +988,14 @@ const fn none<T>() -> Option<T> {
 pub struct TorrentMetaV1File<BufType> {
     pub length: u64,
     pub path: Vec<BufType>,
+    /// `path.utf-8`: the path in UTF-8, set by some clients next to a `path` in a legacy
+    /// encoding. Not used for file names on disk; web seed URLs prefer it, like libtorrent.
+    #[serde(
+        rename = "path.utf-8",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub path_utf8: Option<Vec<BufType>>,
 
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
     pub attr: Option<BufType>,
@@ -1003,6 +1019,7 @@ where
         TorrentMetaV1File {
             length: self.length,
             path: self.path.clone_to_owned(within_buffer),
+            path_utf8: self.path_utf8.clone_to_owned(within_buffer),
             attr: self.attr.clone_to_owned(within_buffer),
             sha1: self.sha1.clone_to_owned(within_buffer),
             symlink_path: self.symlink_path.clone_to_owned(within_buffer),
@@ -1019,6 +1036,7 @@ where
     fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
         TorrentMetaV1Info {
             name: self.name.clone_to_owned(within_buffer),
+            name_utf8: self.name_utf8.clone_to_owned(within_buffer),
             pieces: self.pieces.clone_to_owned(within_buffer),
             piece_length: self.piece_length,
             length: self.length,
