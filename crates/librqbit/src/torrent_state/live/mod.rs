@@ -50,7 +50,7 @@ use std::{
     num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -58,6 +58,7 @@ use std::{
 use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
+use futures::{FutureExt, future::BoxFuture};
 use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
@@ -305,10 +306,7 @@ impl TorrentStateLive {
                 unflushed_bitv_bytes: 0,
             }),
             files: paused.files,
-            stats: AtomicStats {
-                have_bytes: AtomicU64::new(have_bytes),
-                ..Default::default()
-            },
+            stats: paused.carried_stats.to_atomic(have_bytes),
             lengths: lengths.clone(),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
@@ -918,6 +916,11 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // Pieces completed since the last periodic flush would otherwise reach the fast-resume
+        // file only when the bitfield is dropped, which may never happen before the process
+        // exits.
+        g.try_flush_bitv(&self.shared, true);
+
         let piece_tracker = g
             .pieces
             .take()
@@ -931,7 +934,22 @@ impl TorrentStateLive {
             files: self.files.take()?,
             chunk_tracker,
             streams: self.streams.clone(),
+            carried_stats: Default::default(),
         })
+    }
+
+    // The counters so far, for the live state a storage operation restarts the torrent in.
+    pub(crate) fn carried_stats(&self) -> super::paused::CarriedStats {
+        super::paused::CarriedStats::snapshot(&self.stats)
+    }
+
+    /// Resolves once the have-bitfield writes queued so far have reached storage.
+    pub(crate) fn wait_bitfield_flushed(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        match self.lock_read("wait_bitfield_flushed").get_chunks() {
+            Ok(chunks) => chunks.get_have_pieces().wait_flushed(),
+            // Paused already: the bitfield moved to the paused state.
+            Err(_) => futures::future::ok(()).boxed(),
+        }
     }
 
     fn on_fatal_error(&self, e: anyhow::Error) -> anyhow::Result<()> {

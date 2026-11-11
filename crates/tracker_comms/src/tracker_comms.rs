@@ -33,7 +33,7 @@ use crate::scrape::{self, ScrapeCounts};
 use crate::tiers::{self, Availability};
 use crate::tracker_comms_http::{self, TrackerRequestEvent};
 use crate::tracker_comms_udp::{self, UdpTrackerClient};
-use librqbit_core::hash_id::Id20;
+use librqbit_core::{hash_id::Id20, proxy::TargetAddr};
 
 pub use crate::tiers::TrackerAnnounceOptions;
 
@@ -1308,6 +1308,23 @@ impl TorrentTrackers {
             (Some(h), Some(p)) => (h, p),
             _ => return JobResult::failed(anyhow::anyhow!("tracker URL needs a host and a port")),
         };
+        // A proxy that can't relay UDP: fail before anything (DNS included) is done.
+        if let Err(e) = self.udp_client.check_usable() {
+            return JobResult::failed(e.into());
+        }
+        // A `socks5h` proxy resolves the host name: it is never looked up here.
+        if let url::Host::Domain(name) = host
+            && self.udp_client.sends_host_names()
+        {
+            let stats = self.stats_for(job);
+            return JobResult {
+                result: self
+                    .announce_udp_endpoint(TargetAddr::Domain(name, port), job, &stats)
+                    .await,
+                resolved: None,
+                panicked: false,
+            };
+        }
         let resolved = match udp_tracker_to_socket_addrs(host, port)
             .instrument(trace_span!("resolve", host=%job.url))
             .await
@@ -1324,13 +1341,13 @@ impl TorrentTrackers {
         let stats = self.stats_for(job);
         let result = match resolved {
             UdpTrackerResolveResult::One(addr) => {
-                self.announce_udp_endpoint(addr, job, &stats).await
+                self.announce_udp_endpoint(addr.into(), job, &stats).await
             }
             UdpTrackerResolveResult::Two(v4, v6) => {
                 let (r4, r6) = tokio::join!(
-                    self.announce_udp_endpoint(v4.into(), job, &stats)
+                    self.announce_udp_endpoint(SocketAddr::from(v4).into(), job, &stats)
                         .instrument(trace_span!("udp request", addr=?v4)),
-                    self.announce_udp_endpoint(v6.into(), job, &stats)
+                    self.announce_udp_endpoint(SocketAddr::from(v6).into(), job, &stats)
                         .instrument(trace_span!("udp request", addr=?v6)),
                 );
                 merge_endpoints(r4, r6)
@@ -1345,7 +1362,7 @@ impl TorrentTrackers {
 
     async fn announce_udp_endpoint(
         &self,
-        addr: SocketAddr,
+        addr: TargetAddr<'_>,
         job: &Job,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Outcome> {
@@ -1367,9 +1384,9 @@ impl TorrentTrackers {
             port: self.announce_port,
             num_want: if job.no_peers { 0 } else { -1 },
         };
-        match self.udp_client.announce(addr, request).await {
+        match self.udp_client.announce_to(addr, request).await {
             Ok(response) => {
-                info!(tracker=?addr, peers=response.addrs.len(), "tracker announce succeeded");
+                info!(tracker=%addr, peers=response.addrs.len(), "tracker announce succeeded");
                 Ok(Outcome {
                     interval: Some(tracker_interval(u64::from(response.interval))),
                     seeders: Some(response.seeders),
@@ -1458,6 +1475,22 @@ impl TorrentTrackers {
                 };
             }
         };
+        if let Err(e) = self.udp_client.check_usable() {
+            return ScrapeResult {
+                result: Err(e.into()),
+                resolved: None,
+            };
+        }
+        let one = |target| self.scrape_udp_target(target);
+        // A `socks5h` proxy resolves the host name: it is never looked up here.
+        if let url::Host::Domain(name) = host
+            && self.udp_client.sends_host_names()
+        {
+            return ScrapeResult {
+                result: one(TargetAddr::Domain(name, port)).await,
+                resolved: None,
+            };
+        }
         let resolved = match udp_tracker_to_socket_addrs(host, port)
             .instrument(trace_span!("resolve", host=%job.url))
             .await
@@ -1473,22 +1506,15 @@ impl TorrentTrackers {
                 }
             },
         };
-        let one = |addr: SocketAddr| async move {
-            self.udp_client
-                .scrape(addr, self.info_hash)
-                .await
-                .map(|r| ScrapeCounts {
-                    seeders: Some(r.seeders),
-                    leechers: Some(r.leechers),
-                    downloaded: Some(r.completed),
-                })
-        };
         // Like the announces: both addresses of a dual-stack tracker are asked, and the larger
         // numbers win.
         let result = match resolved {
-            UdpTrackerResolveResult::One(addr) => one(addr).await,
+            UdpTrackerResolveResult::One(addr) => one(addr.into()).await,
             UdpTrackerResolveResult::Two(v4, v6) => {
-                let (r4, r6) = tokio::join!(one(v4.into()), one(v6.into()));
+                let (r4, r6) = tokio::join!(
+                    one(SocketAddr::from(v4).into()),
+                    one(SocketAddr::from(v6).into())
+                );
                 match (r4, r6) {
                     (Ok(a), Ok(b)) => Ok(a.max(b)),
                     (Ok(a), Err(_)) => Ok(a),
@@ -1501,6 +1527,18 @@ impl TorrentTrackers {
             result,
             resolved: Some(resolved),
         }
+    }
+
+    /// Scrapes one address (or host name, resolved by the proxy) of a UDP tracker.
+    async fn scrape_udp_target(&self, target: TargetAddr<'_>) -> anyhow::Result<ScrapeCounts> {
+        self.udp_client
+            .scrape_from(target, self.info_hash)
+            .await
+            .map(|r| ScrapeCounts {
+                seeders: Some(r.seeders),
+                leechers: Some(r.leechers),
+                downloaded: Some(r.completed),
+            })
     }
 }
 

@@ -114,6 +114,7 @@ pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DEFAULT_PEER_LIMIT, DhtSessionConfig,
     ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
+pub use storage::MoveStorageMode;
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
@@ -127,6 +128,9 @@ pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
+/// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
+/// checked (and shown without its password) before a session is created with it.
+pub use librqbit_core::proxy::{ProxyConfig, ProxyKind, ProxyUrlError};
 pub use librqbit_core::torrent_metainfo::*;
 
 #[cfg(test)]

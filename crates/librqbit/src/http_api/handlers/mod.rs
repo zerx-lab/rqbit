@@ -66,6 +66,9 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/delete": "Forget about the torrent, remove the files",
             "POST /torrents/{id_or_infohash}/add_peers": "Add peers (newline-delimited)",
             "POST /torrents/{id_or_infohash}/update_only_files": "Change the selection of files to download. You need to POST json of the following form {\"only_files\": [0, 1, 2]}",
+            "POST /torrents/{id_or_infohash}/force_recheck": "Forget which pieces are downloaded and verify the files again. Returns once the check has started",
+            "POST /torrents/{id_or_infohash}/move_storage": "Move the files to another folder. You need to POST json of the following form {\"output_folder\": \"/new/folder\", \"mode\": \"fail_if_exists\"} (mode: fail_if_exists (default), overwrite or keep_existing)",
+            "POST /torrents/{id_or_infohash}/rename_file": "Rename or move a file inside the output folder. You need to POST json of the following form {\"file_index\": 0, \"path\": \"new/relative/path\"}",
             "GET /torrents/{id_or_infohash}/limits": "The torrent's own rate limits, {\"upload_bps\": ..., \"download_bps\": ...} (null: unlimited)",
             "POST /torrents/{id_or_infohash}/limits": "Change the torrent's own rate limits. POST json of the form {\"upload_bps\": 1048576, \"download_bps\": null} (null: unlimited)",
             "GET /torrents/peer_limit": "How many peers all torrents together may have connecting or connected, {\"peer_limit\": ...} (null: no session-wide limit)",
@@ -169,6 +172,18 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/{id}/update_only_files",
                 post(torrents::h_torrent_action_update_only_files),
+            )
+            .route(
+                "/torrents/{id}/force_recheck",
+                post(torrents::h_torrent_action_force_recheck),
+            )
+            .route(
+                "/torrents/{id}/move_storage",
+                post(torrents::h_torrent_action_move_storage),
+            )
+            .route(
+                "/torrents/{id}/rename_file",
+                post(torrents::h_torrent_action_rename_file),
             )
             .route(
                 "/torrents/{id}/file_priorities",

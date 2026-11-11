@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
 use crate::{
     PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory,
@@ -9,7 +9,7 @@ use anyhow::Context;
 use futures::{StreamExt, stream::BoxStream};
 use librqbit_core::{Id20, spawn_utils::spawn};
 use sqlx::{Pool, Postgres};
-use tracing::debug_span;
+use tracing::{debug_span, warn};
 
 use super::{SerializedTorrent, SessionPersistenceStore};
 
@@ -29,6 +29,8 @@ struct TorrentsTableRecord {
     is_paused: bool,
     sequential: bool,
     first_last_pieces_first: bool,
+    // Session::rename_file, as a JSON object (file index -> relative path). NULL if none.
+    renamed_files: Option<String>,
     upload_bps: Option<i64>,
     download_bps: Option<i64>,
     peer_limit: Option<i64>,
@@ -57,6 +59,16 @@ fn peer_limit_to_column(v: Option<usize>) -> Option<i64> {
 
 impl TorrentsTableRecord {
     fn into_serialized_torrent(self) -> Option<(TorrentId, SerializedTorrent)> {
+        let renamed_files = match self.renamed_files.as_deref() {
+            None => BTreeMap::new(),
+            Some(s) => match serde_json::from_str(s) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(id = self.id, "ignoring broken renamed_files {s:?}: {e:#}");
+                    BTreeMap::new()
+                }
+            },
+        };
         Some((
             self.id as TorrentId,
             SerializedTorrent {
@@ -72,6 +84,7 @@ impl TorrentsTableRecord {
                     sequential: self.sequential,
                     first_last_pieces_first: self.first_last_pieces_first,
                 },
+                renamed_files,
                 ratelimits: LimitsConfig {
                     upload_bps: bps_from_column(self.upload_bps),
                     download_bps: bps_from_column(self.download_bps),
@@ -95,6 +108,17 @@ impl TorrentsTableRecord {
             },
         ))
     }
+}
+
+// The renamed_files column of a torrent: NULL when nothing is renamed.
+fn renamed_files_column(torrent: &ManagedTorrentHandle) -> anyhow::Result<Option<String>> {
+    let renamed = torrent.shared().renamed_files();
+    if renamed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&renamed)
+        .map(Some)
+        .context("error serializing renamed_files")
 }
 
 impl PostgresSessionStorage {
@@ -137,6 +161,7 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS first_last_pieces_first BOOLEAN NOT NULL DEFAULT FALSE"
         );
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS renamed_files TEXT");
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS upload_bps BIGINT");
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS download_bps BIGINT");
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS peer_limit BIGINT");
@@ -170,8 +195,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, web_seeds)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, web_seeds)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
@@ -190,9 +215,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             )
             .bind(
                 torrent
-                    .shared()
-                    .options
-                    .output_folder
+                    .output_folder()
                     .to_str()
                     .context("output_folder")?
                     .to_owned(),
@@ -205,6 +228,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(torrent.is_paused())
             .bind(piece_picking.sequential)
             .bind(piece_picking.first_last_pieces_first)
+            .bind(renamed_files_column(torrent)?)
             .bind(bps_to_column(ratelimits.upload_bps))
             .bind(bps_to_column(ratelimits.download_bps))
             .bind(peer_limit_to_column(torrent.peer_limit()))
@@ -246,8 +270,10 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
         let (pieces, levels) = piece_priority_columns(torrent);
+        // The output folder changes with Session::move_storage, the file paths with
+        // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, upload_bps = $5, download_bps = $6, peer_limit = $7, file_priorities = $8, piece_priority_pieces = $9, piece_priority_levels = $10, web_seeds = $11 WHERE id = $12",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, web_seeds = $13 WHERE id = $14",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -257,6 +283,14 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(torrent.is_paused())
         .bind(piece_picking.sequential)
         .bind(piece_picking.first_last_pieces_first)
+        .bind(
+            torrent
+                .output_folder()
+                .to_str()
+                .context("output_folder")?
+                .to_owned(),
+        )
+        .bind(renamed_files_column(torrent)?)
         .bind(bps_to_column(ratelimits.upload_bps))
         .bind(bps_to_column(ratelimits.download_bps))
         .bind(peer_limit_to_column(torrent.peer_limit()))
@@ -265,9 +299,9 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(levels)
         .bind(torrent.web_seed_urls())
         .bind::<i32>(id.try_into()?)
-            .execute(&self.pool)
-            .await
-            .context("error executing UPDATE torrents")?;
+        .execute(&self.pool)
+        .await
+        .context("error executing UPDATE torrents")?;
         Ok(())
     }
 
