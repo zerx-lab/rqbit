@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf};
 
 use crate::{
-    PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle, type_aliases::BF,
+    PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory,
+    limits::LimitsConfig, session::TorrentId, torrent_state::ManagedTorrentHandle,
+    type_aliases::BF,
 };
 use anyhow::Context;
 use futures::{StreamExt, stream::BoxStream};
@@ -30,6 +31,28 @@ struct TorrentsTableRecord {
     first_last_pieces_first: bool,
     // Session::rename_file, as a JSON object (file index -> relative path). NULL if none.
     renamed_files: Option<String>,
+    upload_bps: Option<i64>,
+    download_bps: Option<i64>,
+    peer_limit: Option<i64>,
+    // NULL in rows written before priorities.
+    file_priorities: Option<Vec<i16>>,
+    // Explicit piece priorities as two parallel arrays: piece index and level.
+    piece_priority_pieces: Vec<i64>,
+    piece_priority_levels: Vec<i16>,
+}
+
+// NULL is unlimited, and so is a value that does not fit (the column is wider than the rate).
+fn bps_from_column(v: Option<i64>) -> Option<NonZeroU32> {
+    NonZeroU32::new(u32::try_from(v?).ok()?)
+}
+
+fn bps_to_column(v: Option<NonZeroU32>) -> Option<i64> {
+    v.map(|v| i64::from(v.get()))
+}
+
+// NULL is the session default; a limit too large for the column is stored as the largest value.
+fn peer_limit_to_column(v: Option<usize>) -> Option<i64> {
+    v.map(|v| i64::try_from(v).unwrap_or(i64::MAX))
 }
 
 impl TorrentsTableRecord {
@@ -60,6 +83,25 @@ impl TorrentsTableRecord {
                     first_last_pieces_first: self.first_last_pieces_first,
                 },
                 renamed_files,
+                ratelimits: LimitsConfig {
+                    upload_bps: bps_from_column(self.upload_bps),
+                    download_bps: bps_from_column(self.download_bps),
+                },
+                peer_limit: self.peer_limit.and_then(|v| usize::try_from(v).ok()),
+                // A level that doesn't fit a u8 can't have been written by us: fall back to
+                // `only_files` rather than shift the other files' levels. Piece entries are
+                // independent, so a bad one is just dropped.
+                file_priorities: self.file_priorities.and_then(|v| {
+                    v.into_iter()
+                        .map(|l| u8::try_from(l).ok())
+                        .collect::<Option<Vec<u8>>>()
+                }),
+                piece_priorities: self
+                    .piece_priority_pieces
+                    .into_iter()
+                    .zip(self.piece_priority_levels)
+                    .filter_map(|(p, l)| Some((u32::try_from(p).ok()?, u8::try_from(l).ok()?)))
+                    .collect(),
             },
         ))
     }
@@ -117,6 +159,16 @@ impl PostgresSessionStorage {
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS first_last_pieces_first BOOLEAN NOT NULL DEFAULT FALSE"
         );
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS renamed_files TEXT");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS upload_bps BIGINT");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS download_bps BIGINT");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS peer_limit BIGINT");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS file_priorities SMALLINT[]");
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_pieces BIGINT[] NOT NULL DEFAULT '{}'"
+        );
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_levels SMALLINT[] NOT NULL DEFAULT '{}'"
+        );
 
         Ok(Self { pool })
     }
@@ -139,10 +191,12 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
+        let ratelimits = torrent.ratelimits();
+        let (pieces, levels) = piece_priority_columns(torrent);
         sqlx::query(q)
             .bind::<i32>(id.try_into()?)
             .bind(&torrent.info_hash().0[..])
@@ -171,6 +225,12 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(piece_picking.sequential)
             .bind(piece_picking.first_last_pieces_first)
             .bind(renamed_files_column(torrent)?)
+            .bind(bps_to_column(ratelimits.upload_bps))
+            .bind(bps_to_column(ratelimits.download_bps))
+            .bind(peer_limit_to_column(torrent.peer_limit()))
+            .bind(file_priority_column(torrent))
+            .bind(pieces)
+            .bind(levels)
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -203,10 +263,12 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
         let piece_picking = torrent.piece_picking();
+        let ratelimits = torrent.ratelimits();
+        let (pieces, levels) = piece_priority_columns(torrent);
         // The output folder changes with Session::move_storage, the file paths with
         // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6 WHERE id = $7",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12 WHERE id = $13",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -224,6 +286,12 @@ impl SessionPersistenceStore for PostgresSessionStorage {
                 .to_owned(),
         )
         .bind(renamed_files_column(torrent)?)
+        .bind(bps_to_column(ratelimits.upload_bps))
+        .bind(bps_to_column(ratelimits.download_bps))
+        .bind(peer_limit_to_column(torrent.peer_limit()))
+        .bind(file_priority_column(torrent))
+        .bind(pieces)
+        .bind(levels)
         .bind::<i32>(id.try_into()?)
         .execute(&self.pool)
         .await
@@ -243,6 +311,22 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .map(Ok);
         Ok(futures::stream::iter(torrents).boxed())
     }
+}
+
+fn file_priority_column(torrent: &ManagedTorrentHandle) -> Vec<i16> {
+    torrent
+        .file_priorities()
+        .into_iter()
+        .map(i16::from)
+        .collect()
+}
+
+fn piece_priority_columns(torrent: &ManagedTorrentHandle) -> (Vec<i64>, Vec<i16>) {
+    torrent
+        .piece_priority_overrides()
+        .into_iter()
+        .map(|(piece, level)| (i64::from(piece), i16::from(level)))
+        .unzip()
 }
 
 struct PgBitfield {

@@ -10,7 +10,7 @@
 //! - NOT_NEEDED (not selected for download)
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -19,10 +19,11 @@ use librqbit_core::lengths::ValidPieceIndex;
 use peer_binary_protocol::Piece;
 
 use crate::{
-    chunk_tracker::{ChunkMarkingResult, ChunkTracker},
+    chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     file_info::FileInfo,
     piece_picker::{PieceAvailability, PiecePicker},
-    type_aliases::{FileInfos, PeerHandle},
+    priority::PieceLevels,
+    type_aliases::PeerHandle,
 };
 
 /// Tracks a piece currently being downloaded.
@@ -30,6 +31,16 @@ use crate::{
 pub struct InflightPiece {
     pub peer: PeerHandle,
     pub started: Instant,
+    /// A stream asked for this piece. Streams read past priority levels, so when the peer is
+    /// slow such a piece is stolen ahead of any level.
+    pub streamed: bool,
+}
+
+/// An in-flight piece another peer could take over.
+struct StealCandidate {
+    piece: ValidPieceIndex,
+    level: u8,
+    streamed: bool,
 }
 
 /// Result of attempting to acquire a piece.
@@ -110,8 +121,6 @@ impl PieceTracker {
         self.chunks
     }
 
-    // === PIECE ACQUISITION ===
-
     /// Attempt to acquire a piece for the requesting peer.
     ///
     /// The acquisition strategy is:
@@ -119,6 +128,10 @@ impl PieceTracker {
     /// 2. Try to reserve a piece from the queue (priority pieces first, then as `picker` orders
     ///    the queue)
     /// 3. Try to steal a piece from a peer that's 3x slower
+    ///
+    /// A steal takes a piece a stream waits for first, otherwise the highest-priority piece
+    /// that qualifies; step 1 gives way when the queue has a piece of a higher priority for
+    /// this peer, unless a stream waits for the stolen one.
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
@@ -128,28 +141,68 @@ impl PieceTracker {
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
+        // The queue pick, once computed. Only needed this early when a steal has to be weighed
+        // against it, which never happens while every wanted piece has the same level.
+        let mut picked = None;
+
         // 1. Try steal with 10x threshold (very slow peer)
-        if let Some(result) = self.try_steal(&req, 10.0) {
-            return result;
+        if let Some(c) = self.steal_candidate(&req, 10.0) {
+            // A stream is waiting for its piece, so a queued one never beats it.
+            let beaten = !c.streamed && c.level < self.chunks.queued_top() && {
+                let p = self.pick_queued(&req);
+                picked = Some(p);
+                p.is_some_and(|p| self.chunks.piece_levels().get(p.get_usize()) > c.level)
+            };
+            if !beaten && let Some(result) = self.steal(c.piece, &req) {
+                return result;
+            }
         }
 
         // 2. Try reserve from priority_pieces then queued pieces
         // First check priority pieces that aren't already downloaded or in-flight
         for piece in &mut req.priority_pieces {
-            if !self.chunks.is_piece_have(piece)
-                && !self.inflight.contains_key(&piece)
-                && (req.peer_has_piece)(piece)
-            {
-                return self.reserve_piece(piece, req.peer);
+            if self.chunks.is_piece_have(piece) {
+                continue;
+            }
+            if let Some(info) = self.inflight.get_mut(&piece) {
+                // Reserved for the queue before the stream reached it: the stream waits for it
+                // all the same.
+                info.streamed = true;
+                continue;
+            }
+            if (req.peer_has_piece)(piece) {
+                return self.reserve_piece(piece, req.peer, true);
             }
         }
 
         // Then the queue (it holds no in-flight pieces), in the picker's order.
-        let lengths = *self.chunks.get_lengths();
-        let picked = req
-            .picker
+        if let Some(piece) = picked.unwrap_or_else(|| self.pick_queued(&req)) {
+            return self.reserve_piece(piece, req.peer, false);
+        }
+
+        // 3. Try steal with 3x threshold (moderately slow peer)
+        if let Some(c) = self.steal_candidate(&req, 3.0)
+            && let Some(result) = self.steal(c.piece, &req)
+        {
+            return result;
+        }
+
+        AcquireResult::NoneAvailable
+    }
+
+    /// The queued piece the picker chooses for this peer.
+    fn pick_queued<I, P, S>(&self, req: &AcquireRequest<I, P, S>) -> Option<ValidPieceIndex>
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        S: Fn(ValidPieceIndex) -> bool,
+    {
+        let lengths = self.chunks.get_lengths().clone();
+        req.picker
             .pick(
                 self.chunks.queued_pieces(),
+                self.chunks.piece_levels(),
+                self.chunks.queued_top(),
                 self.chunks.get_hns().have_bytes,
                 req.availability,
                 |p| {
@@ -160,38 +213,36 @@ impl PieceTracker {
                 },
             )
             .and_then(|p| u32::try_from(p).ok())
-            .and_then(|p| lengths.validate_piece_index(p));
-        if let Some(piece) = picked {
-            return self.reserve_piece(piece, req.peer);
-        }
-
-        // 3. Try steal with 3x threshold (moderately slow peer)
-        if let Some(result) = self.try_steal(&req, 3.0) {
-            return result;
-        }
-
-        AcquireResult::NoneAvailable
+            .and_then(|p| lengths.validate_piece_index(p))
     }
 
     /// Reserve a piece: remove from queue, add to inflight.
-    fn reserve_piece(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> AcquireResult {
+    fn reserve_piece(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        streamed: bool,
+    ) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
         self.inflight.insert(
             piece,
             InflightPiece {
                 peer,
                 started: Instant::now(),
+                streamed,
             },
         );
         AcquireResult::Reserved(piece)
     }
 
-    /// Try to steal a piece from a slower peer.
-    fn try_steal<I, P, S>(
-        &mut self,
+    /// The piece to steal from a slower peer: of the pieces another peer has been downloading
+    /// for `threshold` times this peer's average and that this peer has, a streamed one first,
+    /// then the highest level, and inside it the one in flight the longest.
+    fn steal_candidate<I, P, S>(
+        &self,
         req: &AcquireRequest<I, P, S>,
         threshold: f64,
-    ) -> Option<AcquireResult>
+    ) -> Option<StealCandidate>
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
@@ -199,18 +250,38 @@ impl PieceTracker {
     {
         let my_avg = req.peer_avg_time?;
         let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
+        let levels = self.chunks.piece_levels();
 
         // Find the slowest piece from another peer that exceeds threshold
         // and that the stealing peer actually has (can download)
-        let (piece, old_peer, _) = self
-            .inflight
+        self.inflight
             .iter()
             .filter(|(_, info)| info.peer != req.peer)
             .filter(|(p, _)| (req.peer_has_piece)(**p))
-            .map(|(p, info)| (*p, info.peer, info.started.elapsed()))
-            .filter(|(_, _, elapsed)| *elapsed >= min_elapsed)
-            .max_by_key(|(_, _, elapsed)| *elapsed)?;
+            .map(|(p, info)| {
+                let candidate = StealCandidate {
+                    piece: *p,
+                    level: levels.get(p.get_usize()),
+                    streamed: info.streamed,
+                };
+                (candidate, info.started.elapsed())
+            })
+            .filter(|(_, elapsed)| *elapsed >= min_elapsed)
+            .max_by_key(|(c, elapsed)| (c.streamed, c.level, *elapsed))
+            .map(|(c, _)| c)
+    }
 
+    /// Hands an in-flight piece to the requesting peer, unless `can_steal` refuses it.
+    fn steal<I, P, S>(
+        &mut self,
+        piece: ValidPieceIndex,
+        req: &AcquireRequest<I, P, S>,
+    ) -> Option<AcquireResult>
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        S: Fn(ValidPieceIndex) -> bool,
+    {
         // Check can_steal (e.g., per_piece_lock)
         if !(req.can_steal)(piece) {
             return None;
@@ -218,6 +289,7 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
+        let old_peer = info.peer;
         info.peer = req.peer;
         info.started = Instant::now();
 
@@ -299,13 +371,33 @@ impl PieceTracker {
         self.chunks.mark_chunk_downloaded(piece)
     }
 
-    /// Update which files are selected for download.
-    pub fn update_only_files(
+    /// Changes the effective priority of the pieces.
+    ///
+    /// Pieces that become wanted are queued; pieces whose level drops to 0 leave the queue, and
+    /// the ones of them in flight are released: they leave the in-flight map and their partly
+    /// written chunks are forgotten. Returns the new byte accounting and the released pieces
+    /// with the peers that were downloading them, whose requests the caller must cancel.
+    /// Pieces a stream asked for stay in flight whatever their level: the stream reads them.
+    pub fn set_piece_levels(
         &mut self,
-        file_infos: &FileInfos,
-        new_only_files: &HashSet<usize>,
-    ) -> anyhow::Result<crate::chunk_tracker::HaveNeededSelected> {
-        self.chunks.update_only_files(file_infos, new_only_files)
+        levels: PieceLevels,
+    ) -> anyhow::Result<(HaveNeededSelected, Vec<(ValidPieceIndex, PeerHandle)>)> {
+        let released: Vec<(ValidPieceIndex, PeerHandle)> = self
+            .inflight
+            .iter()
+            .filter(|(p, info)| !info.streamed && levels.get(p.get_usize()) == 0)
+            .map(|(p, info)| (*p, info.peer))
+            .collect();
+        let inflight = &self.inflight;
+        let hns = self
+            .chunks
+            .set_piece_levels(levels, |p| inflight.contains_key(&p))?;
+        for (piece, _) in &released {
+            self.inflight.remove(piece);
+            // Not selected any more, so this forgets its chunks without queueing it.
+            self.chunks.mark_piece_broken_if_not_have(*piece);
+        }
+        Ok((hns, released))
     }
 
     /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
@@ -328,7 +420,10 @@ impl PieceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{bitv::BitV as BitVTrait, type_aliases::BF};
+    use crate::{
+        bitv::BitV as BitVTrait,
+        type_aliases::{BF, FileInfos},
+    };
     use librqbit_core::lengths::Lengths;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -351,10 +446,7 @@ mod tests {
         let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
 
         // All pieces selected
-        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
-        for i in 0..num_pieces as usize {
-            selected.set(i, true);
-        }
+        let levels = PieceLevels::new(vec![1u8; num_pieces as usize].into_boxed_slice());
 
         // Single file spanning all pieces
         let file_infos = vec![crate::file_info::FileInfo {
@@ -365,7 +457,7 @@ mod tests {
             attrs: Default::default(),
         }];
 
-        ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap()
+        ChunkTracker::new(have.into_dyn(), levels, lengths, &file_infos).unwrap()
     }
 
     fn make_test_file_infos(num_pieces: u32) -> FileInfos {
@@ -392,7 +484,7 @@ mod tests {
             ..Default::default()
         };
         (
-            PiecePicker::new(picking, lengths, file_infos, None),
+            PiecePicker::new(picking, lengths, file_infos, &vec![1; file_infos.len()]),
             PieceAvailability::new(total),
         )
     }
@@ -823,5 +915,274 @@ mod tests {
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
+    }
+
+    /// A single-file torrent with one piece per entry of `levels`, at those levels.
+    fn make_leveled_chunk_tracker(levels: &[u8]) -> ChunkTracker {
+        let num_pieces = u32::try_from(levels.len()).unwrap();
+        let lengths = Lengths::new(16384 * u64::from(num_pieces), 16384).unwrap();
+        let have =
+            BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into_boxed_slice());
+        ChunkTracker::new(
+            have.into_dyn(),
+            PieceLevels::new(levels.into()),
+            lengths,
+            &make_test_file_infos(num_pieces),
+        )
+        .unwrap()
+    }
+
+    /// Peer A downloads piece 0 (handed to it directly, not through a stream) and then the
+    /// piece the picker gives it.
+    fn reserve_0_then_pick(
+        tracker: &mut PieceTracker,
+        picker: &PiecePicker,
+        availability: &PieceAvailability,
+    ) -> ValidPieceIndex {
+        let piece_0 = tracker
+            .chunks
+            .get_lengths()
+            .validate_piece_index(0)
+            .unwrap();
+        let first = tracker.reserve_piece(piece_0, peer(1), false);
+        assert!(matches!(first, AcquireResult::Reserved(p) if p == piece_0));
+        match tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::empty(),
+            picker,
+            availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        }) {
+            AcquireResult::Reserved(p) => p,
+            other => panic!("expected Reserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_steal_takes_the_highest_level_piece() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[1, 7, 1]));
+        let file_infos = make_test_file_infos(3);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        let high = reserve_0_then_pick(&mut tracker, &picker, &availability);
+        assert_eq!(high.get(), 1);
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Piece 0 has been in flight longer, but piece 1 is the more important one. Piece 2 is
+        // queued, but at a lower level than the steal.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::from_micros(100)),
+            priority_pieces: std::iter::empty(),
+            picker: &picker,
+            availability: &availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        match result {
+            AcquireResult::Stolen { piece, from_peer } => {
+                assert_eq!(piece, high);
+                assert_eq!(from_peer, peer(1));
+            }
+            other => panic!("expected Stolen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_steal_gives_way_to_a_higher_queued_piece() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[1, 1, 7]));
+        let file_infos = make_test_file_infos(3);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        // Peer A holds pieces 0 and 2; then piece 2 is given back, as when its peer dies.
+        reserve_0_then_pick(&mut tracker, &picker, &availability);
+        assert_eq!(tracker.release_pieces_owned_by(peer(1)), 2);
+        let piece_0 = tracker
+            .chunks
+            .get_lengths()
+            .validate_piece_index(0)
+            .unwrap();
+        assert!(matches!(
+            tracker.reserve_piece(piece_0, peer(1), false),
+            AcquireResult::Reserved(p) if p == piece_0
+        ));
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Piece 0 is slow enough to steal, but queued piece 2 is worth more.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::from_micros(100)),
+            priority_pieces: std::iter::empty(),
+            picker: &picker,
+            availability: &availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        assert!(
+            matches!(result, AcquireResult::Reserved(p) if p.get() == 2),
+            "expected piece 2 from the queue, got {result:?}"
+        );
+        assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer(1));
+    }
+
+    #[test]
+    fn test_level_zero_pieces_are_never_reserved() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[0, 1, 0]));
+        let file_infos = make_test_file_infos(3);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        let mut got = Vec::new();
+        loop {
+            match tracker.acquire_piece(AcquireRequest {
+                peer: peer(1),
+                peer_avg_time: None,
+                priority_pieces: std::iter::empty(),
+                picker: &picker,
+                availability: &availability,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            }) {
+                AcquireResult::Reserved(p) => got.push(p.get()),
+                AcquireResult::NoneAvailable => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn test_lowering_to_zero_releases_only_the_unwanted_in_flight_pieces() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[1, 1, 1, 0]));
+        let file_infos = make_test_file_infos(4);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        let reserve = |tracker: &mut PieceTracker, who: u8, piece: u32, streamed: bool| {
+            let piece = tracker
+                .chunks
+                .get_lengths()
+                .validate_piece_index(piece)
+                .unwrap();
+            let got = if streamed {
+                tracker.acquire_piece(AcquireRequest {
+                    peer: peer(who),
+                    peer_avg_time: None,
+                    priority_pieces: std::iter::once(piece),
+                    picker: &picker,
+                    availability: &availability,
+                    peer_has_piece: |_| true,
+                    can_steal: |_| false,
+                })
+            } else {
+                tracker.reserve_piece(piece, peer(who), false)
+            };
+            assert!(matches!(got, AcquireResult::Reserved(p) if p == piece));
+        };
+        reserve(&mut tracker, 1, 0, false);
+        reserve(&mut tracker, 2, 1, false);
+        // Piece 3 is at 0 and in flight: a stream asked for it.
+        reserve(&mut tracker, 3, 3, true);
+
+        let (hns, released) = tracker
+            .set_piece_levels(PieceLevels::new(vec![1u8, 0, 0, 0].into_boxed_slice()))
+            .unwrap();
+        assert_eq!(
+            released
+                .iter()
+                .map(|(p, who)| (p.get(), *who))
+                .collect::<Vec<_>>(),
+            vec![(1, peer(2))]
+        );
+        assert_eq!(hns.selected_bytes, 16384);
+        assert_eq!(hns.needed_bytes, 16384);
+        assert!(tracker.get_inflight(released[0].0).is_none());
+        // The wanted piece and the stream's piece stay with their peers.
+        let valid = |i| {
+            tracker
+                .chunks
+                .get_lengths()
+                .validate_piece_index(i)
+                .unwrap()
+        };
+        assert_eq!(tracker.get_inflight(valid(0)).unwrap().peer, peer(1));
+        assert_eq!(tracker.get_inflight(valid(3)).unwrap().peer, peer(3));
+        // Nothing at 0 is queued.
+        assert_eq!(tracker.chunks.queued_pieces().count_ones(), 0);
+    }
+
+    #[test]
+    fn test_a_stalled_stream_piece_is_stolen_ahead_of_any_level() {
+        // Piece 0 belongs to a skipped file a stream reads; pieces 1 and 2 are queued at 7.
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[0, 7, 7]));
+        let file_infos = make_test_file_infos(3);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        let piece_0 = tracker
+            .chunks
+            .get_lengths()
+            .validate_piece_index(0)
+            .unwrap();
+        let first = tracker.acquire_piece(AcquireRequest {
+            peer: peer(1),
+            peer_avg_time: None,
+            priority_pieces: std::iter::once(piece_0),
+            picker: &picker,
+            availability: &availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        assert!(matches!(first, AcquireResult::Reserved(p) if p == piece_0));
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // A fast peer takes the stream's piece over, although the queue has higher levels.
+        let result = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: Some(Duration::from_micros(100)),
+            priority_pieces: std::iter::empty(),
+            picker: &picker,
+            availability: &availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        assert!(
+            matches!(result, AcquireResult::Stolen { piece, from_peer } if piece == piece_0 && from_peer == peer(1)),
+            "expected the stream's piece to be stolen, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_queue_piece_a_stream_reaches_survives_lowering_to_zero() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[1, 1]));
+        let file_infos = make_test_file_infos(2);
+        let (picker, availability) = make_sequential_picker(&file_infos);
+        let piece_0 = tracker
+            .chunks
+            .get_lengths()
+            .validate_piece_index(0)
+            .unwrap();
+        tracker.reserve_piece(piece_0, peer(1), false);
+        // A stream starts reading piece 0 while it is in flight; peer 2 gets piece 1 instead.
+        let next = tracker.acquire_piece(AcquireRequest {
+            peer: peer(2),
+            peer_avg_time: None,
+            priority_pieces: std::iter::once(piece_0),
+            picker: &picker,
+            availability: &availability,
+            peer_has_piece: |_| true,
+            can_steal: |_| true,
+        });
+        assert!(matches!(next, AcquireResult::Reserved(p) if p.get() == 1));
+        assert!(tracker.get_inflight(piece_0).unwrap().streamed);
+
+        let (_, released) = tracker
+            .set_piece_levels(PieceLevels::new(vec![0u8, 0].into_boxed_slice()))
+            .unwrap();
+        assert_eq!(
+            released
+                .iter()
+                .map(|(p, who)| (p.get(), *who))
+                .collect::<Vec<_>>(),
+            vec![(1, peer(2))]
+        );
+        assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer(1));
     }
 }

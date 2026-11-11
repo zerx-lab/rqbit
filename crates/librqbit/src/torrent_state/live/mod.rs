@@ -58,6 +58,7 @@ use std::{
 use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
+use futures::{FutureExt, future::BoxFuture};
 use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
@@ -77,7 +78,7 @@ use peer_binary_protocol::{
     },
 };
 use tokio::sync::{
-    Notify, OwnedSemaphorePermit, Semaphore,
+    Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -87,8 +88,8 @@ use crate::{
     Error,
     choker::{Choker, ChokerPeer, RECHOKE_INTERVAL, Registration, SlotClass, Transferred},
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
+    connection_limit::PeerPermits,
     file_ops::FileOps,
-    limits::Limits,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -98,6 +99,7 @@ use crate::{
     },
     piece_picker::{PieceAvailability, PiecePicker, PiecePicking},
     piece_tracker::{AcquireRequest, AcquireResult, PieceTracker},
+    priority::PieceLevels,
     session::CheckedIncomingConnection,
     session_stats::SessionStats,
     stream_connect::ConnectionKind,
@@ -197,8 +199,8 @@ pub struct TorrentStateLive {
     stats: AtomicStats,
     lengths: Lengths,
 
-    // Limits how many active (occupying network resources) peers there are at a moment in time.
-    peer_semaphore: Arc<Semaphore>,
+    // How many peers occupy network resources (connecting or connected) at a time is limited by
+    // shared.options.peer_slots and session_peer_slots; every peer task holds a permit of both.
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -224,7 +226,6 @@ pub struct TorrentStateLive {
     // We have every selected piece. Changes with the selection and with completed pieces, and is
     // read for every event reported to the peer policy.
     selection_complete: Arc<AtomicBool>,
-    ratelimits: Limits,
 
     // Decides which interested peers we upload to.
     choker: Arc<Choker>,
@@ -239,10 +240,19 @@ impl TorrentStateLive {
             .max(1)
     }
 
+    // Whether another peer connection could start now: neither the torrent's peer limit nor
+    // the session's is reached.
+    fn has_room_for_peers(&self) -> bool {
+        let options = &self.shared.options;
+        options.peer_slots.has_room() && options.session_peer_slots.has_room()
+    }
+
+    /// `file_levels` is the priority of every file, for the picker; the levels of the pieces
+    /// come with `paused`'s chunk tracker.
     pub(crate) fn new(
         paused: TorrentStatePaused,
         piece_picking: PiecePicking,
-        only_files: Option<&HashSet<usize>>,
+        file_levels: &[u8],
         fatal_errors_tx: tokio::sync::oneshot::Sender<anyhow::Error>,
         cancellation_token: CancellationToken,
     ) -> anyhow::Result<Arc<Self>> {
@@ -257,15 +267,15 @@ impl TorrentStateLive {
         let up_speed_estimator = SpeedEstimator::default();
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
-        let lengths = *paused.chunk_tracker.get_lengths();
+        let lengths = paused.chunk_tracker.get_lengths().clone();
         let selection_complete =
             Arc::new(AtomicBool::new(paused.chunk_tracker.get_hns().finished()));
 
         let picker = PiecePicker::new(
             piece_picking,
-            lengths,
+            lengths.clone(),
             &paused.metadata.file_infos,
-            only_files,
+            file_levels,
         );
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
@@ -277,7 +287,6 @@ impl TorrentStateLive {
             .peer_policy
             .is_some()
             .then(unbounded_channel::<UploadRequest>);
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -298,10 +307,7 @@ impl TorrentStateLive {
             }),
             files: paused.files,
             stats: paused.carried_stats.to_atomic(have_bytes),
-            lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
+            lengths: lengths.clone(),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
@@ -318,7 +324,6 @@ impl TorrentStateLive {
             throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
             refused_peers: Default::default(),
             selection_complete,
-            ratelimits,
             choker: Arc::new(Choker::new(
                 paused.shared.options.upload_slots,
                 Instant::now(),
@@ -403,21 +408,21 @@ impl TorrentStateLive {
         &self.up_speed_estimator
     }
 
+    /// Hands over an incoming connection. `permits`: the torrent's and the session's, taken
+    /// while the connection was checked; `None` if either limit was reached, which refuses it.
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        permits: Option<PeerPermits>,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                debug!("limit of live peers reached, dropping incoming peer");
-                self.peers.with_peer(checked_peer.addr, |p| {
-                    atomic_inc(&p.stats.counters.incoming_connections);
-                });
-                return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
-            }
+        let Some(permits) = permits else {
+            debug!("limit of live peers reached, dropping incoming peer");
+            self.peers.with_peer(checked_peer.addr, |p| {
+                atomic_inc(&p.stats.counters.incoming_connections);
+            });
+            return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
         };
 
         let counters = match self.peers.states.entry(checked_peer.addr) {
@@ -468,10 +473,13 @@ impl TorrentStateLive {
                 "[{}][addr={}]manage_incoming_peer",
                 self.shared.id, checked_peer.addr
             ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+            aframe!(self.clone().task_manage_incoming_peer(
+                checked_peer,
+                counters,
+                tx,
+                rx,
+                permits
+            )),
         );
         Ok(AddIncomingPeerResult::Added)
     }
@@ -498,7 +506,7 @@ impl TorrentStateLive {
                 _ = tx.closed() => {
                     continue;
                 }
-                res = self.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
+                res = self.shared.options.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
                     res?;
                 }
             };
@@ -517,15 +525,7 @@ impl TorrentStateLive {
                             continue;
                         }
                         res = session.throttled_upload.acquire(NonZeroU32::new(ci.size).unwrap()) => {
-                            if let Err(e) = res {
-                                warn!(
-                                    id = self.shared.id,
-                                    info_hash = ?self.shared.info_hash,
-                                    "dropping a throttled upload request: {e:#}"
-                                );
-                                gate.should_upload(&ci);
-                                continue;
-                            }
+                            res?;
                         }
                     }
                 }
@@ -570,7 +570,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        permits: PeerPermits,
     ) -> crate::Result<()> {
         let policy = self.peer_policy_binding(checked_peer.addr);
         let choker = self.choker_registration(&tx, policy.gate(), &counters);
@@ -585,6 +585,7 @@ impl TorrentStateLive {
             counters,
             choker,
             first_message_received: AtomicBool::new(false),
+            waits_for_rate: AtomicBool::new(false),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
@@ -627,14 +628,14 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         };
-        drop(permit);
+        drop(permits);
         Ok(())
     }
 
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        permits: PeerPermits,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -656,6 +657,7 @@ impl TorrentStateLive {
             counters,
             choker,
             first_message_received: AtomicBool::new(false),
+            waits_for_rate: AtomicBool::new(false),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
@@ -708,7 +710,7 @@ impl TorrentStateLive {
                 handler.on_peer_died(Some(e))?;
             }
         }
-        drop(permit);
+        drop(permits);
         Ok(())
     }
 
@@ -785,11 +787,15 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            // Held by the connection task for as long as it lives; see PeerPermits::acquire for
+            // why the torrent's permit comes first.
+            let options = &state.shared.options;
+            let permits =
+                PeerPermits::acquire(&options.peer_slots, &options.session_peer_slots).await?;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(addr, permits)),
             );
             if let Some(i) = connect_interval {
                 tokio::time::sleep(i).await;
@@ -910,6 +916,11 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // Pieces completed since the last periodic flush would otherwise reach the fast-resume
+        // file only when the bitfield is dropped, which may never happen before the process
+        // exits.
+        g.try_flush_bitv(&self.shared, true);
+
         let piece_tracker = g
             .pieces
             .take()
@@ -932,6 +943,15 @@ impl TorrentStateLive {
         super::paused::CarriedStats::snapshot(&self.stats)
     }
 
+    /// Resolves once the have-bitfield writes queued so far have reached storage.
+    pub(crate) fn wait_bitfield_flushed(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        match self.lock_read("wait_bitfield_flushed").get_chunks() {
+            Ok(chunks) => chunks.get_have_pieces().wait_flushed(),
+            // Paused already: the bitfield moved to the paused state.
+            Err(_) => futures::future::ok(()).boxed(),
+        }
+    }
+
     fn on_fatal_error(&self, e: anyhow::Error) -> anyhow::Result<()> {
         let mut g = self.lock_write("fatal_error");
         let tx = g
@@ -945,24 +965,50 @@ impl TorrentStateLive {
         Err(res)
     }
 
-    pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+    /// Changes the priorities: `levels` is the new effective level of every piece and
+    /// `file_levels` the level of every file.
+    ///
+    /// Takes effect from the next piece reservation on. Pieces in flight whose level drops to 0
+    /// are given up: their requests are cancelled at the peers downloading them. Data on disk
+    /// stays.
+    pub(crate) fn set_priorities(
+        &self,
+        levels: PieceLevels,
+        file_levels: &[u8],
+    ) -> anyhow::Result<()> {
         // The flag is written under the state lock, like in on_piece_completed: outside of it a
         // stale value could overwrite a newer one.
-        let hns = {
-            let mut g = self.lock_write("update_only_files");
-            let hns = g
-                .get_pieces_mut()?
-                .update_only_files(&self.metadata.file_infos, only_files)?;
+        let (hns, released) = {
+            let mut g = self.lock_write("set_priorities");
+            let (hns, released) = g.get_pieces_mut()?.set_piece_levels(levels)?;
             g.picker
-                .update_only_files(&self.metadata.file_infos, Some(only_files));
+                .update_files(&self.metadata.file_infos, file_levels);
             self.selection_complete
                 .store(hns.finished(), Ordering::Release);
-            hns
+            (hns, released)
         };
         // With the state lock released. A dying peer holds its shard of the peer table
         // while it asks whether the torrent is finished (on_peer_died), so touching the
         // table under the state lock is the reverse order, and the two deadlock.
-        if !hns.finished() {
+        for (piece, peer) in released {
+            trace!(
+                piece = piece.get(),
+                ?peer,
+                "piece no longer wanted, cancelling its requests"
+            );
+            self.peers
+                .with_live_mut(peer, "cancel_unwanted_piece", |live| {
+                    live.cancel_inflight_requests_for_piece(piece)
+                });
+        }
+        // Peers waiting for something to request look at the queue again.
+        self.new_pieces_notify.notify_waiters();
+        if hns.finished() {
+            self.finished_notify.notify_waiters();
+            if !self.has_active_streams_unfinished_files(&self.lock_read("set_priorities")) {
+                self.disconnect_all_peers_that_have_full_torrent();
+            }
+        } else {
             self.reconnect_all_not_needed_peers();
         }
         Ok(())
@@ -1034,6 +1080,11 @@ impl TorrentStateLive {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
+                // Tell the trackers once. This only runs when the last selected piece completes
+                // while the torrent runs, so torrents that were already complete when added or
+                // resumed never get here. Fine under the state lock: the trackers' own lock
+                // is a leaf, they never call back into the torrent while holding it.
+                self.shared.tracker_comms.completed();
             }
             self.finished_notify.notify_waiters();
 
@@ -1049,6 +1100,7 @@ impl TorrentStateLive {
     }
 
     fn disconnect_all_peers_that_have_full_torrent(&self) {
+        let mut hung_up = Vec::new();
         for mut pe in self.peers.states.iter_mut() {
             if let PeerState::Live(l) = pe.value().get_state()
                 && l.has_full_torrent(self.lengths.total_pieces() as usize)
@@ -1059,7 +1111,33 @@ impl TorrentStateLive {
                     .unwrap()
                     .tx
                     .send(WriterRequest::Disconnect(Ok(())));
+                hung_up.push(*pe.key());
             }
+        }
+        if hung_up.is_empty() {
+            return;
+        }
+
+        // The entries are NotNeeded now, so when these connections end on_peer_died leaves
+        // their pieces alone. Something may still be in flight with them, such as a piece a
+        // closed stream asked for on a skipped file: give it back here, or it would stay
+        // reserved and could never be queued when that file is raised. The peer table guards
+        // are gone, so taking the state lock keeps the lock order.
+        let mut g = self.lock_write("release_pieces_of_hung_up_peers");
+        let pieces = match g.get_pieces_mut() {
+            Ok(pieces) => pieces,
+            Err(e) => {
+                debug!(error = %e, "no pieces to release from hung up peers");
+                return;
+            }
+        };
+        let released: usize = hung_up
+            .into_iter()
+            .map(|addr| pieces.release_pieces_owned_by(addr))
+            .sum();
+        if released > 0 {
+            trace!(released, "released the in-flight pieces of hung up peers");
+            self.new_pieces_notify.notify_waiters();
         }
     }
 
@@ -1283,6 +1361,9 @@ struct PeerHandler {
 
     first_message_received: AtomicBool,
 
+    // The requester holds back the next request until the download rate limits allow it.
+    waits_for_rate: AtomicBool,
+
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
@@ -1394,13 +1475,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         if self.requested_inflight_count() != Some(0) {
             return false;
         }
+        // Nothing asked of it because we pace ourselves: any other peer would wait the same.
+        if self.waits_for_rate.load(Ordering::Relaxed) {
+            return true;
+        }
         let they_wait = self.choker.waits_for_slot();
         if self.state.is_finished_and_no_active_streams() {
             return they_wait;
         }
         // While we still look for peers to download from, a connection that does nothing is
-        // only kept for as long as no other peer could use it.
-        (they_wait || self.is_choked()) && self.state.peer_semaphore.available_permits() > 0
+        // only kept for as long as no other peer could use it: neither the torrent's peer limit
+        // nor the session's is reached.
+        (they_wait || self.is_choked()) && self.state.has_room_for_peers()
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {
@@ -1536,6 +1622,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    // Both the torrent's and the session's download limits.
+    async fn wait_for_download_rate(&self, len: u32) -> crate::Result<()> {
+        let Some(len) = NonZeroU32::new(len) else {
+            return Ok(());
+        };
+        self.state
+            .shared
+            .options
+            .ratelimits
+            .prepare_for_download(len)
+            .await?;
+        if let Some(session) = self.state.torrent().session.upgrade() {
+            session.ratelimits.prepare_for_download(len).await?;
+        }
+        Ok(())
+    }
+
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
@@ -1551,6 +1654,23 @@ impl PeerHandler {
                 return Ok(());
             }
         };
+        // A connection we hung up on (disconnect_all_peers_that_have_full_torrent marks the
+        // entry NotNeeded right away) can end after the torrent wanted the peer back, e.g. a
+        // file was raised from priority 0: the entry is then queued again, owned by the next
+        // connection to the same address, or dead after that one failed. That entry is not
+        // ours to change, so this is decided before taking the state out of it: taking a live
+        // state un-counts its pieces from the availability, and putting it back would not
+        // count them again.
+        let superseded = match pe.value().get_state() {
+            PeerState::Queued | PeerState::Dead => true,
+            PeerState::Connecting(tx) => !tx.same_channel(&self.tx),
+            PeerState::Live(live) => !live.tx.same_channel(&self.tx),
+            PeerState::NotNeeded => false,
+        };
+        if superseded {
+            trace!("connection superseded by a newer one, leaving the peer entry alone");
+            return Ok(());
+        }
         let prev = pe.value_mut().take_state(peers);
 
         match prev {
@@ -1583,21 +1703,10 @@ impl PeerHandler {
                     self.state.new_pieces_notify.notify_waiters();
                 }
             }
-            PeerState::NotNeeded => {
+            // NotNeeded: we hung up on it. Queued and Dead were left alone above.
+            s @ (PeerState::NotNeeded | PeerState::Queued | PeerState::Dead) => {
                 // Restore it as std::mem::take() replaced it above.
-                pe.value_mut().set_state(PeerState::NotNeeded, peers);
-                return Ok(());
-            }
-            s @ PeerState::Queued | s @ PeerState::Dead => {
-                warn!(
-                    id = self.state.shared.id,
-                    info_hash = ?self.state.shared.info_hash,
-                    addr = ?handle,
-                    "bug: peer was in a wrong state {s:?}, ignoring it forever"
-                );
-                // Prevent deadlocks.
-                drop(pe);
-                self.state.peers.drop_peer(handle);
+                pe.value_mut().set_state(s, peers);
                 return Ok(());
             }
         };
@@ -2072,17 +2181,12 @@ impl PeerHandler {
 
                 aframe!(self.wait_for_request_slot()).await;
 
-                self.state
-                    .ratelimits
-                    .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                    .await?;
-
-                if let Some(session) = self.state.torrent().session.upgrade() {
-                    session
-                        .ratelimits
-                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                        .await?;
-                }
+                // At a low rate this can take longer than the read timeout, while the peer has
+                // nothing to send: its silence is excused meanwhile.
+                self.waits_for_rate.store(true, Ordering::Relaxed);
+                let paced = self.wait_for_download_rate(request.length).await;
+                self.waits_for_rate.store(false, Ordering::Relaxed);
+                paced?;
 
                 aframe!(self.wait_for_request_slot()).await;
 

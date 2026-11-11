@@ -525,6 +525,10 @@ export const MockAPI: RqbitAPI & { getVersion: () => Promise<string> } = {
           v4: { attempts: 0, successes: 0, errors: 0 },
           v6: { attempts: 0, successes: 0, errors: 0 },
         },
+        http_proxy: {
+          v4: { attempts: 0, successes: 0, errors: 0 },
+          v6: { attempts: 0, successes: 0, errors: 0 },
+        },
       },
       download_speed: {
         mbps: downloadSpeed,
@@ -535,6 +539,7 @@ export const MockAPI: RqbitAPI & { getVersion: () => Promise<string> } = {
         human_readable: `${uploadSpeed.toFixed(1)} MB/s`,
       },
       uptime_seconds: Math.floor(Date.now() / 1000) % 86400,
+      peer_connections: Math.floor(Math.random() * 400),
     };
   },
 

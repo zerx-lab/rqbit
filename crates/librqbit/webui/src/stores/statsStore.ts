@@ -26,6 +26,7 @@ export const useStatsStore = create<StatsStore>((set) => ({
     download_speed: { human_readable: "N/A", mbps: 0 },
     upload_speed: { human_readable: "N/A", mbps: 0 },
     uptime_seconds: 0,
+    peer_connections: 0,
     connections: {
       tcp: {
         v4: {
@@ -52,6 +53,18 @@ export const useStatsStore = create<StatsStore>((set) => ({
         },
       },
       socks: {
+        v4: {
+          attempts: 0,
+          successes: 0,
+          errors: 0,
+        },
+        v6: {
+          attempts: 0,
+          successes: 0,
+          errors: 0,
+        },
+      },
+      http_proxy: {
         v4: {
           attempts: 0,
           successes: 0,

@@ -246,15 +246,19 @@ impl Api {
         let handle = self.mgr_handle(idx)?;
         let info_hash = handle.shared().info_hash;
         let only_files = handle.only_files();
+        let file_priorities = handle.file_priorities();
         let output_folder = handle.output_folder().to_string_lossy().into_owned();
         make_torrent_details(
             Some(handle.id()),
             &info_hash,
             handle.metadata.load().as_ref().map(|r| &r.info),
             handle.name().as_deref(),
-            only_files.as_deref(),
+            FileStates {
+                only_files: only_files.as_deref(),
+                priorities: Some(&file_priorities),
+                renamed: &handle.shared().renamed_files(),
+            },
             output_folder,
-            &handle.shared().renamed_files(),
         )
     }
 
@@ -393,6 +397,32 @@ impl Api {
         Ok(Default::default())
     }
 
+    /// The priority of every file, by file index (see [`crate::Priority`]).
+    pub fn api_torrent_file_priorities(
+        &self,
+        idx: TorrentIdOrHash,
+    ) -> Result<TorrentFilePrioritiesResponse> {
+        let handle = self.mgr_handle(idx)?;
+        Ok(TorrentFilePrioritiesResponse {
+            file_priorities: handle.file_priorities(),
+        })
+    }
+
+    /// Sets the priority of some files, `(file index, level)`.
+    pub async fn api_torrent_action_set_file_priorities(
+        &self,
+        idx: TorrentIdOrHash,
+        priorities: &[(usize, u8)],
+    ) -> Result<EmptyJsonResponse> {
+        let handle = self.mgr_handle(idx)?;
+        self.session
+            .set_file_priorities(&handle, priorities)
+            .await
+            .context("error setting file priorities")
+            .with_status(StatusCode::BAD_REQUEST)?;
+        Ok(Default::default())
+    }
+
     pub fn api_set_rust_log(&self, new_value: String) -> Result<EmptyJsonResponse> {
         let tx = self
             .rust_log_reload_tx
@@ -437,9 +467,12 @@ impl Api {
                     &handle.info_hash(),
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
-                    handle.only_files().as_deref(),
+                    FileStates {
+                        only_files: handle.only_files().as_deref(),
+                        priorities: Some(&handle.file_priorities()),
+                        renamed: &handle.shared().renamed_files(),
+                    },
                     handle.output_folder().to_string_lossy().into_owned(),
-                    &handle.shared().renamed_files(),
                 )
                 .context("error making torrent details")?;
                 ApiAddTorrentResponse {
@@ -465,9 +498,12 @@ impl Api {
                     &info_hash,
                     Some(&info),
                     None,
-                    only_files.as_deref(),
+                    FileStates {
+                        only_files: only_files.as_deref(),
+                        priorities: None,
+                        renamed: &BTreeMap::new(),
+                    },
                     output_folder.to_string_lossy().into_owned().to_string(),
-                    &BTreeMap::new(),
                 )
                 .context("error making torrent details")?,
             },
@@ -477,9 +513,12 @@ impl Api {
                     &handle.info_hash(),
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
-                    handle.only_files().as_deref(),
+                    FileStates {
+                        only_files: handle.only_files().as_deref(),
+                        priorities: Some(&handle.file_priorities()),
+                        renamed: &handle.shared().renamed_files(),
+                    },
                     handle.output_folder().to_string_lossy().into_owned(),
-                    &handle.shared().renamed_files(),
                 )
                 .context("error making torrent details")?;
                 ApiAddTorrentResponse {
@@ -562,6 +601,16 @@ pub struct TorrentDetailsResponseFile {
     pub length: u64,
     pub included: bool,
     pub attributes: FileDetailsAttrs,
+    /// The download priority of the file, 0 to 7 (see [`crate::Priority`]). Missing for a torrent
+    /// that is only listed, not added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TorrentFilePrioritiesResponse {
+    /// The priority of every file, by file index.
+    pub file_priorities: Vec<u8>,
 }
 
 #[derive(Default, Serialize)]
@@ -592,15 +641,27 @@ pub struct ApiAddTorrentResponse {
     pub seen_peers: Option<Vec<SocketAddr>>,
 }
 
+// What the torrent does with each of its files, for the details response.
+struct FileStates<'a> {
+    only_files: Option<&'a [usize]>,
+    priorities: Option<&'a [u8]>,
+    // Files stored under another path than the torrent gives them (Session::rename_file).
+    renamed: &'a BTreeMap<usize, PathBuf>,
+}
+
 fn make_torrent_details(
     id: Option<TorrentId>,
     info_hash: &Id20,
     info: Option<&ValidatedTorrentMetaV1Info<ByteBufOwned>>,
     name: Option<&str>,
-    only_files: Option<&[usize]>,
+    file_states: FileStates<'_>,
     output_folder: String,
-    renamed_files: &BTreeMap<usize, PathBuf>,
 ) -> Result<TorrentDetailsResponse> {
+    let FileStates {
+        only_files,
+        priorities: file_priorities,
+        renamed: renamed_files,
+    } = file_states;
     let files = match info {
         Some(info) => info
             .iter_file_details()
@@ -623,6 +684,7 @@ fn make_torrent_details(
                     length: d.len,
                     included,
                     attributes: d.attrs(),
+                    priority: file_priorities.and_then(|p| p.get(idx).copied()),
                 }
             })
             .collect(),

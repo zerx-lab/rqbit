@@ -69,6 +69,14 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/{id_or_infohash}/force_recheck": "Forget which pieces are downloaded and verify the files again. Returns once the check has started",
             "POST /torrents/{id_or_infohash}/move_storage": "Move the files to another folder. You need to POST json of the following form {\"output_folder\": \"/new/folder\", \"mode\": \"fail_if_exists\"} (mode: fail_if_exists (default), overwrite or keep_existing)",
             "POST /torrents/{id_or_infohash}/rename_file": "Rename or move a file inside the output folder. You need to POST json of the following form {\"file_index\": 0, \"path\": \"new/relative/path\"}",
+            "GET /torrents/{id_or_infohash}/limits": "The torrent's own rate limits, {\"upload_bps\": ..., \"download_bps\": ...} (null: unlimited)",
+            "POST /torrents/{id_or_infohash}/limits": "Change the torrent's own rate limits. POST json of the form {\"upload_bps\": 1048576, \"download_bps\": null} (null: unlimited)",
+            "GET /torrents/peer_limit": "How many peers all torrents together may have connecting or connected, {\"peer_limit\": ...} (null: no session-wide limit)",
+            "POST /torrents/peer_limit": "Change the session-wide peer limit. POST json of the form {\"peer_limit\": 500} (null: no limit). Lowering it disconnects nobody",
+            "GET /torrents/{id_or_infohash}/peer_limit": "The torrent's own peer limit, {\"peer_limit\": ...} (null: the session default)",
+            "POST /torrents/{id_or_infohash}/peer_limit": "Change the torrent's own peer limit. POST json of the form {\"peer_limit\": 50} (null: the session default). Lowering it disconnects nobody",
+            "GET /torrents/{id_or_infohash}/file_priorities": "The download priority of every file, 0 (skip) to 7 (maximum): {\"file_priorities\": [1, 0, 7]}",
+            "POST /torrents/{id_or_infohash}/file_priorities": "Set the priority of some files, as [file index, priority] pairs: {\"file_priorities\": [[0, 7], [2, 0]]}",
             "POST /rust_log": "Set RUST_LOG to this post launch (for debugging)",
         },
         "server": "rqbit",
@@ -108,7 +116,23 @@ pub fn make_api_router(state: ApiState) -> Router {
             "/torrents/{id}/stream/{file_id}/{*filename}",
             get(streaming::h_torrent_stream_file),
         )
-        .route("/torrents/limits", get(configure::h_get_session_ratelimits));
+        .route(
+            "/torrents/{id}/file_priorities",
+            get(torrents::h_torrent_file_priorities),
+        )
+        .route("/torrents/limits", get(configure::h_get_session_ratelimits))
+        .route(
+            "/torrents/{id}/limits",
+            get(configure::h_get_torrent_ratelimits),
+        )
+        .route(
+            "/torrents/peer_limit",
+            get(configure::h_get_global_peer_limit),
+        )
+        .route(
+            "/torrents/{id}/peer_limit",
+            get(configure::h_get_torrent_peer_limit),
+        );
 
     if !state.opts.read_only {
         api_router = api_router
@@ -116,6 +140,18 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/limits",
                 post(configure::h_update_session_ratelimits),
+            )
+            .route(
+                "/torrents/{id}/limits",
+                post(configure::h_update_torrent_ratelimits),
+            )
+            .route(
+                "/torrents/peer_limit",
+                post(configure::h_update_global_peer_limit),
+            )
+            .route(
+                "/torrents/{id}/peer_limit",
+                post(configure::h_update_torrent_peer_limit),
             )
             .route(
                 "/torrents/{id}/pause",
@@ -148,6 +184,10 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/{id}/rename_file",
                 post(torrents::h_torrent_action_rename_file),
+            )
+            .route(
+                "/torrents/{id}/file_priorities",
+                post(torrents::h_torrent_action_set_file_priorities),
             )
             .route("/torrents/{id}/add_peers", post(torrents::h_add_peers))
             .route("/torrents/create", post(torrents::h_create_torrent));

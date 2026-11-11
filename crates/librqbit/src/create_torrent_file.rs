@@ -163,7 +163,7 @@ async fn create_torrent_raw<'a>(
     Ok(CreateTorrentRawResult {
         info: TorrentMetaV1Info {
             name: Some(name),
-            pieces: piece_hashes.into(),
+            pieces: Some(piece_hashes.into()),
             piece_length,
             length: if single_file_mode { Some(length) } else { None },
             md5sum: None,
@@ -176,6 +176,8 @@ async fn create_torrent_raw<'a>(
             sha1: None,
             symlink_path: None,
             private: false,
+            meta_version: None,
+            file_tree: None,
         },
         output_folder,
     })
@@ -239,6 +241,8 @@ pub async fn create_torrent<'a>(
             publisher_url: None,
             creation_date: None,
             info_hash,
+            info_hash_v2: None,
+            piece_layers: None,
         },
         output_folder: res.output_folder,
     })
@@ -284,7 +288,16 @@ mod tests {
         )
         .await
         .unwrap();
-        torrent.meta.info.data.pieces.as_ref().len() / 20
+        torrent
+            .meta
+            .info
+            .data
+            .pieces
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .len()
+            / 20
     }
 
     // libtorrent rejects a torrent that has more piece hashes than pieces.

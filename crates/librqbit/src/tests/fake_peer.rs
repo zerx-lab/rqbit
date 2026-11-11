@@ -26,7 +26,8 @@ use tokio::{
 
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, CreateTorrentOptions, ListenerOptions,
-    PeerConnectionOptions, Session, SessionOptions, UploadSlots, create_torrent,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, UploadSlots,
+    create_torrent,
     limits::LimitsConfig,
     spawn_utils::BlockingSpawner,
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging},
@@ -432,16 +433,28 @@ pub(super) struct ClientOpts {
     pub(super) initial_peers: Vec<SocketAddr>,
     /// How long a peer may send nothing before the client gives up on it. `None`: the default.
     pub(super) read_write_timeout: Option<Duration>,
+    /// Keep the session's JSON persistence, with fastresume, in the client's folder.
+    pub(super) persistence: bool,
+    /// Download into this folder instead of a fresh temporary one, e.g. the folder of an
+    /// earlier client, to pick up where it stopped.
+    pub(super) dir: Option<TempDir>,
 }
 
-/// A client downloading the torrent of `seed` into an empty folder.
+/// A client downloading the torrent of `seed` into an empty folder, or into `opts.dir`.
 pub(super) async fn start_client(seed: &Fixture, opts: ClientOpts) -> anyhow::Result<Fixture> {
-    let dir = TempDir::with_prefix("rqbit_fake_peer_client")?;
+    let dir = match opts.dir {
+        Some(dir) => dir,
+        None => TempDir::with_prefix("rqbit_fake_peer_client")?,
+    };
+    let persistence = opts.persistence.then(|| SessionPersistenceConfig::Json {
+        folder: Some(dir.path().join("session")),
+    });
     let session = Session::new_with_opts(
         dir.path().into(),
         SessionOptions {
             dht: None,
-            persistence: None,
+            fastresume: persistence.is_some(),
+            persistence,
             listen: opts.listen.then(loopback_listener),
             connect: Some(ConnectionOptions::default()),
             ipv4_only: true,

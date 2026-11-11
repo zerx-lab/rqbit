@@ -165,7 +165,7 @@ impl ManagedTorrent {
                     TorrentStateInitializing::new(
                         self.shared.clone(),
                         metadata,
-                        init.only_files.clone(),
+                        init.priorities.clone(),
                         storage,
                         init.previously_errored(),
                     )
@@ -192,7 +192,7 @@ impl ManagedTorrent {
             .load_full()
             .context("torrent is not resolved")?;
         let mut g = self.locked.write();
-        let only_files = g.only_files.clone();
+        let priorities = g.priorities.clone();
         let (files, carried) = match &mut g.state {
             ManagedTorrentState::Paused(p) => (p.files.take()?, p.carried_stats),
             ManagedTorrentState::Initializing(init) => (init.files.take()?, init.carried_stats()),
@@ -203,7 +203,7 @@ impl ManagedTorrent {
         // "previously errored" is what makes the check drop the stored bitfield and hash
         // everything.
         let init =
-            TorrentStateInitializing::new(self.shared.clone(), metadata, only_files, files, true)
+            TorrentStateInitializing::new(self.shared.clone(), metadata, priorities, files, true)
                 .with_carried_stats(carried);
         g.state = ManagedTorrentState::Initializing(Arc::new(init));
         self.state_change_notify.notify_waiters();

@@ -29,7 +29,7 @@ use librqbit_core::lengths::Lengths;
 use librqbit_core::spawn_utils::spawn_with_cancel;
 use librqbit_core::torrent_metainfo::ValidatedTorrentMetaV1Info;
 pub use live::*;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -43,10 +43,12 @@ use tracing::warn;
 use crate::Session;
 use crate::choker::UploadSlots;
 use crate::chunk_tracker::ChunkTracker;
+use crate::connection_limit::ConnectionLimit;
 use crate::file_info::FileInfo;
 use crate::file_ops::InitialCheckPaused;
-use crate::limits::LimitsConfig;
+use crate::limits::{Limits, LimitsConfig};
 use crate::piece_picker::PiecePicking;
+use crate::priority::Priorities;
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
@@ -117,14 +119,14 @@ pub(crate) struct ManagedTorrentLocked {
     // This should change only on "unpause".
     pub(crate) paused: bool,
     pub(crate) state: ManagedTorrentState,
-    pub(crate) only_files: Option<Vec<usize>>,
+    // What the user asked to download. Kept here, not in the live state, so it survives pause /
+    // resume and applies once an initial check finishes.
+    pub(crate) priorities: Priorities,
     // Kept here, not in the live state, so it survives pause / resume.
     pub(crate) piece_picking: PiecePicking,
 }
 
-#[derive(Default)]
 pub(crate) struct ManagedTorrentOptions {
-    pub force_tracker_interval: Option<Duration>,
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
     /// BT handshake + MSE exchange timeout for live-torrent peers; None falls
@@ -139,9 +141,20 @@ pub(crate) struct ManagedTorrentOptions {
     /// Per-peer admission / upload policy installed on the session.
     pub peer_policy: Option<Arc<dyn crate::PeerPolicy>>,
     pub allow_overwrite: bool,
-    pub ratelimits: LimitsConfig,
+    /// The torrent's own rate limits. They live here, not in the live state, so that a change
+    /// survives pause / resume; the session limits apply on top of them.
+    pub ratelimits: Limits,
     pub initial_peers: Vec<SocketAddr>,
-    pub peer_limit: Option<usize>,
+    /// The torrent's own peer limit as set by the user (`None`: the session default), the value
+    /// that is persisted.
+    pub peer_limit: Mutex<Option<usize>>,
+    /// The limit used when `peer_limit` is `None`.
+    pub default_peer_limit: usize,
+    /// The torrent's cap on connecting + connected peers. It lives here, not in the live state,
+    /// so that a change survives pause / resume.
+    pub peer_slots: Arc<ConnectionLimit>,
+    /// The session-wide cap, shared by all torrents of the session.
+    pub session_peer_slots: Arc<ConnectionLimit>,
     pub upload_slots: UploadSlots,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
@@ -209,6 +222,8 @@ pub struct ManagedTorrentShared {
     pub info_hash: Id20,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
+    /// Talks to the trackers of the torrent. See [`tracker_comms::TorrentTrackers`].
+    pub(crate) tracker_comms: Arc<tracker_comms::TorrentTrackers>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -329,6 +344,13 @@ impl ManagedTorrent {
             .file_relative_path(metadata.as_ref()?, file_index)
     }
 
+    /// The state of every tracker of this torrent, ordered by tier and by position in the
+    /// tier. Works in every state of the torrent: while it is paused the trackers report what
+    /// they were last known to be.
+    pub fn trackers(&self) -> Vec<tracker_comms::TrackerStats> {
+        self.shared.tracker_comms.stats()
+    }
+
     pub fn with_metadata<R>(
         &self,
         mut f: impl FnMut(&Arc<TorrentMetadata>) -> R,
@@ -342,8 +364,72 @@ impl ManagedTorrent {
         self.shared.info_hash
     }
 
+    /// The files with a non-zero priority, or None when every file that is not padding has one.
     pub fn only_files(&self) -> Option<Vec<usize>> {
-        self.locked.read().only_files.clone()
+        let metadata = self.metadata.load();
+        let metadata = metadata.as_ref()?;
+        self.locked
+            .read()
+            .priorities
+            .only_files(&metadata.file_infos)
+    }
+
+    /// The priority of every file, by file index. Padding files report 0.
+    pub fn file_priorities(&self) -> Vec<u8> {
+        self.locked.read().priorities.files().to_vec()
+    }
+
+    /// The effective priority of every piece, by piece index: its explicit level if it has one,
+    /// otherwise the highest level of the files it overlaps. Empty while the torrent is not
+    /// resolved.
+    pub fn piece_priorities(&self) -> Vec<u8> {
+        let metadata = self.metadata.load();
+        let Some(metadata) = metadata.as_ref() else {
+            return Vec::new();
+        };
+        self.locked
+            .read()
+            .priorities
+            .piece_levels(metadata.lengths(), &metadata.file_infos)
+            .as_slice()
+            .to_vec()
+    }
+
+    /// The explicit per-piece priorities, by piece index.
+    pub(crate) fn piece_priority_overrides(&self) -> Vec<(u32, u8)> {
+        self.locked.read().priorities.piece_overrides().collect()
+    }
+
+    /// The torrent's own upload and download rate limits (`None`: unlimited). The session
+    /// limits apply on top of them.
+    pub fn ratelimits(&self) -> LimitsConfig {
+        self.shared.options.ratelimits.get_config()
+    }
+
+    /// Change the torrent's own rate limits, in any state. A live torrent applies them at once
+    /// to both directions.
+    pub(crate) fn set_ratelimits(&self, limits: LimitsConfig) {
+        self.shared.options.ratelimits.set_config(limits);
+    }
+
+    /// The torrent's own cap on connecting + connected peers as set with
+    /// [`Session::set_torrent_peer_limit`] or [`crate::AddTorrentOptions::peer_limit`]. `None`:
+    /// the session's default ([`crate::SessionOptions::peer_limit`], 128 if that isn't set
+    /// either). The session-wide cap applies on top of it.
+    pub fn peer_limit(&self) -> Option<usize> {
+        *self.shared.options.peer_limit.lock()
+    }
+
+    /// Change the torrent's own peer limit, in any state.
+    pub(crate) fn set_peer_limit(&self, limit: Option<usize>) {
+        let options = &self.shared.options;
+        // Under the lock, so that concurrent changes can't leave the cap and the stored value
+        // apart.
+        let mut own = options.peer_limit.lock();
+        *own = limit;
+        options
+            .peer_slots
+            .set_limit(Some(limit.unwrap_or(options.default_peer_limit)));
     }
 
     /// How the torrent orders the pieces it downloads.
@@ -506,6 +592,20 @@ impl ManagedTorrent {
                             match check_result {
                                 Ok(paused) => {
                                     let mut g = g;
+                                    let mut paused = paused;
+                                    // Priorities may have changed while the check ran.
+                                    if g.priorities != init.priorities {
+                                        let levels = g.priorities.piece_levels(
+                                            init.metadata.lengths(),
+                                            &init.metadata.file_infos,
+                                        );
+                                        if let Err(err) = paused.set_piece_levels(levels) {
+                                            let result = anyhow::anyhow!("{:?}", err);
+                                            g.state = ManagedTorrentState::Error(err);
+                                            t.state_change_notify.notify_waiters();
+                                            return Err(result);
+                                        }
+                                    }
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     // A pause requested after the last piece was checked
@@ -556,12 +656,10 @@ impl ManagedTorrent {
                     }
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    let only_files: Option<HashSet<usize>> =
-                        g.only_files.as_ref().map(|f| f.iter().copied().collect());
                     let live = TorrentStateLive::new(
                         paused,
                         g.piece_picking,
-                        only_files.as_ref(),
+                        g.priorities.files(),
                         tx,
                         token.clone(),
                     )?;
@@ -579,7 +677,7 @@ impl ManagedTorrent {
                     let initializing = Arc::new(TorrentStateInitializing::new(
                         t.shared.clone(),
                         metadata.clone(),
-                        g.only_files.clone(),
+                        g.priorities.clone(),
                         t.shared
                             .storage_factory
                             .create_and_init(t.shared(), &metadata)?,
@@ -643,6 +741,20 @@ impl ManagedTorrent {
                 bail!("can't pause torrent in error state")
             }
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+        }
+    }
+
+    /// Resolves once the have-bitfield writes queued so far (fast-resume data) have reached
+    /// storage. Queues no write of its own.
+    pub(crate) fn wait_bitfield_flushed(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        let g = self.locked.read();
+        match &g.state {
+            ManagedTorrentState::Paused(p) => p.chunk_tracker.get_have_pieces().wait_flushed(),
+            ManagedTorrentState::Live(l) => l.wait_bitfield_flushed(),
+            // No bitfield is held in these states.
+            ManagedTorrentState::Initializing(_)
+            | ManagedTorrentState::Error(_)
+            | ManagedTorrentState::None => futures::future::ok(()).boxed(),
         }
     }
 
@@ -759,36 +871,49 @@ impl ManagedTorrent {
         .boxed()
     }
 
-    // Returns true if needed to unpause torrent.
-    // This is just implementation detail - it's easier to pause/unpause than to tinker with internals.
+    /// Sets the priority of some files, `(file index, level)`. An unknown index or a level above
+    /// 7 is an error and changes nothing.
+    pub(crate) fn set_file_priorities(&self, priorities: &[(usize, u8)]) -> anyhow::Result<()> {
+        self.update_priorities(|p, file_infos, _| p.set_files(file_infos, priorities))
+    }
+
+    /// Sets (`Some`) or clears (`None`) explicit priorities of pieces, `(piece index, level)`.
+    /// An unknown piece or a level above 7 is an error and changes nothing.
+    pub(crate) fn set_piece_priorities(
+        &self,
+        priorities: &[(u32, Option<u8>)],
+    ) -> anyhow::Result<()> {
+        self.update_priorities(|p, _, lengths| p.set_pieces(lengths.total_pieces(), priorities))
+    }
+
+    /// Downloads exactly `only_files`: the files outside it get priority 0, the files in it keep
+    /// theirs, or become normal if they were at 0.
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
+        self.update_priorities(|p, file_infos, _| p.set_only_files(file_infos, only_files))
+    }
+
+    /// Changes the priorities with `change`, then applies them to the current state: a paused
+    /// or live torrent right away, an initializing one when its check finishes, an errored one
+    /// when it restarts.
+    fn update_priorities(
+        &self,
+        change: impl FnOnce(&mut Priorities, &FileInfos, &Lengths) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let metadata = self.metadata.load();
         let metadata = metadata.as_ref().context("torrent is not resolved")?;
-        let file_count = metadata.file_infos.len();
-        for f in only_files.iter().copied() {
-            if f >= file_count {
-                anyhow::bail!("only_files contains invalid value {f}")
-            }
-        }
-
-        // if live, need to update chunk tracker
-        // - if already finished: need to pause, then unpause (to reopen files etc)
-        // if paused, need to update chunk tracker
 
         let mut g = self.locked.write();
+        let mut priorities = g.priorities.clone();
+        change(&mut priorities, &metadata.file_infos, metadata.lengths())?;
+        let levels = priorities.piece_levels(metadata.lengths(), &metadata.file_infos);
         match &mut g.state {
-            ManagedTorrentState::Initializing(_) => bail!("can't update initializing torrent"),
-            ManagedTorrentState::Error(_) => {}
-            ManagedTorrentState::None => {}
-            ManagedTorrentState::Paused(p) => {
-                p.update_only_files(only_files)?;
-            }
-            ManagedTorrentState::Live(l) => {
-                l.update_only_files(only_files)?;
-            }
+            ManagedTorrentState::Initializing(_)
+            | ManagedTorrentState::Error(_)
+            | ManagedTorrentState::None => {}
+            ManagedTorrentState::Paused(p) => p.set_piece_levels(levels)?,
+            ManagedTorrentState::Live(l) => l.set_priorities(levels, priorities.files())?,
         };
-
-        g.only_files = Some(only_files.iter().copied().collect());
+        g.priorities = priorities;
         Ok(())
     }
 }
