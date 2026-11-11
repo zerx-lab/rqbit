@@ -652,8 +652,11 @@ pub struct SessionOptions {
     pub disable_fast_extension: bool,
 
     /// Reach the I2P network through the SAM bridge of a local I2P router, for the torrents
-    /// that have I2P trackers. `None` (the default): no I2P, such trackers report an error.
-    /// See [`I2pOptions`].
+    /// that have I2P trackers. `None` (the default): no I2P, such trackers report an error
+    /// and synthetic I2P addresses can't be dialed. See [`I2pOptions`] for what is supported
+    /// (SAM 3.1 streams, transient destinations, I2P HTTP trackers, mixed mode) and what is not
+    /// (the I2P DHT, UDP trackers, persistent destinations). [`PeerPolicy`] sees I2P peers under
+    /// their synthetic `0100::/64` addresses.
     pub i2p: Option<I2pOptions>,
 }
 
@@ -1862,8 +1865,7 @@ impl Session {
         }
         let make_peer_rx = || {
             self.make_peer_rx(
-                info_hash,
-                &tracker_comms,
+                (info_hash, &tracker_comms),
                 alt_tracker_comms.as_ref().map(|(h, t)| (*h, t)),
                 announce,
                 opts.initial_peers.clone().unwrap_or_default(),
@@ -2286,8 +2288,7 @@ impl Session {
             .alt_info_hash()
             .zip(shared.alt_tracker_comms.as_ref());
         self.make_peer_rx(
-            t.info_hash(),
-            &shared.tracker_comms,
+            (t.info_hash(), &shared.tracker_comms),
             alt,
             announce,
             shared.options.initial_peers.clone(),
@@ -2344,13 +2345,12 @@ impl Session {
     }
 
     // Get a peer stream from both DHT and trackers. A hybrid torrent lives in two swarms, so
-    // it is announced and looked up under both `info_hash` and its truncated v2 hash (`alt`,
-    // with the trackers that announce that hash), and the peers of both feed the same stream.
-    #[allow(clippy::too_many_arguments)]
+    // it is announced and looked up under both its info hash (`main`) and its truncated v2 hash
+    // (`alt`), each with the trackers that announce that hash, and the peers of both feed the
+    // same stream.
     fn make_peer_rx(
         self: &Arc<Self>,
-        info_hash: Id20,
-        trackers: &Arc<TorrentTrackers>,
+        main: (Id20, &Arc<TorrentTrackers>),
         alt: Option<(Id20, &Arc<TorrentTrackers>)>,
         announce: bool,
         mut initial_peers: Vec<SocketAddr>,
@@ -2364,7 +2364,7 @@ impl Session {
         let alt_rx = alt.and_then(|(alt_hash, alt_trackers)| {
             self.swarm_peer_rx(alt_hash, alt_trackers, announce, is_private)
         });
-        let main_rx = self.swarm_peer_rx(info_hash, trackers, announce, is_private);
+        let main_rx = self.swarm_peer_rx(main.0, main.1, announce, is_private);
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
