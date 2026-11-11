@@ -649,6 +649,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 .map(|s| s.split(",").map(|v| v.to_string()).collect()),
             port: None,
             persistence,
+            ..Default::default()
         })
     };
 
