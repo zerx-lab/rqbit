@@ -307,6 +307,10 @@ struct Opts {
     #[arg(long = "disable-trackers", env = "RQBIT_TRACKERS_DISABLE")]
     disable_trackers: bool,
 
+    /// Never download from web seeds (BEP 19 `url-list` / magnet `ws=` HTTP sources)
+    #[arg(long = "disable-web-seeds", env = "RQBIT_WEB_SEEDS_DISABLE")]
+    disable_web_seeds: bool,
+
     /// Disable the Fast Extension (BEP 6: HaveAll / HaveNone, rejects, allowed-fast pieces)
     #[arg(long = "disable-fast-extension", env = "RQBIT_FAST_EXTENSION_DISABLE")]
     disable_fast_extension: bool,
@@ -704,6 +708,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         allowlist_url: opts.allowlist_url.take(),
         disable_local_service_discovery: opts.disable_local_peer_discovery,
         disable_trackers: opts.disable_trackers,
+        disable_web_seeds: opts.disable_web_seeds,
         trackers,
         tracker_announce: Default::default(),
         peer_limit: opts.peer_limit,

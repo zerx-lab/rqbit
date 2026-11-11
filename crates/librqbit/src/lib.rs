@@ -24,6 +24,8 @@
 //!
 
 #![warn(clippy::cast_possible_truncation)]
+// The `serde_json::json!` listing of the HTTP API endpoints needs more than the default.
+#![recursion_limit = "256"]
 
 macro_rules! aframe {
     ($e:expr) => {{
@@ -89,6 +91,7 @@ pub mod upnp_server_adapter;
 mod vectored_traits;
 #[cfg(feature = "watch")]
 pub mod watch;
+mod webseed;
 
 pub use error::{Error, Result};
 
@@ -122,6 +125,7 @@ pub use torrent_state::{
 };
 pub use tracker_comms::{TrackerAnnounceOptions, TrackerState, TrackerStats};
 pub use type_aliases::FileInfos;
+pub use webseed::{WebSeedState, WebSeedStats};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

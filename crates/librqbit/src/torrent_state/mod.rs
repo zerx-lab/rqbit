@@ -241,6 +241,8 @@ pub struct ManagedTorrentShared {
     // Where the files are. Session::move_storage and Session::rename_file change it at run
     // time. A leaf lock: nothing else is locked while it's held.
     pub(crate) location: RwLock<StorageLocation>,
+    /// The web seeds (BEP 19) of the torrent.
+    pub(crate) web_seeds: crate::webseed::WebSeeds,
 }
 
 /// Where the files of a torrent are stored.
