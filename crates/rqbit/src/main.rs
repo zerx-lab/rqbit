@@ -763,6 +763,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         peer_backoff: None,
         peer_policy: None,
         disable_fast_extension: opts.disable_fast_extension,
+        i2p: None,
     };
 
     #[allow(clippy::needless_update)]

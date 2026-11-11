@@ -29,11 +29,16 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, debug_span, info, trace, trace_span};
 use url::Url;
 
+use crate::i2p::{self, I2pTrackers};
 use crate::scrape::{self, ScrapeCounts};
 use crate::tiers::{self, Availability};
 use crate::tracker_comms_http::{self, TrackerRequestEvent};
 use crate::tracker_comms_udp::{self, UdpTrackerClient};
-use librqbit_core::{hash_id::Id20, proxy::TargetAddr};
+use librqbit_core::{
+    hash_id::Id20,
+    i2p::{is_i2p_host, is_synthetic},
+    proxy::TargetAddr,
+};
 
 pub use crate::tiers::TrackerAnnounceOptions;
 
@@ -172,6 +177,8 @@ pub struct TrackerCommsParams {
     pub timings: TrackerTimings,
     /// When false, the trackers are kept and reported, but never contacted.
     pub enabled: bool,
+    /// Whether the torrent is an I2P torrent, and how its trackers reach I2P.
+    pub i2p: I2pTrackers,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +227,8 @@ enum Kind {
     Http,
     Udp,
     Unsupported,
+    /// An HTTP tracker inside I2P, reached through the I2P router.
+    I2p,
 }
 
 #[derive(Debug)]
@@ -276,26 +285,44 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn new(url: Url) -> Self {
-        let kind = match url.scheme() {
+    fn new(url: Url, i2p: &I2pTrackers) -> Self {
+        let in_i2p = url.host_str().is_some_and(is_i2p_host);
+        let mut kind = match url.scheme() {
             "http" | "https" => Kind::Http,
             "udp" => Kind::Udp,
             _ => Kind::Unsupported,
         };
-        let unsupported = kind == Kind::Unsupported;
-        let scrapable = match kind {
-            Kind::Http => scrape::is_scrapable(&url),
-            Kind::Udp => true,
-            Kind::Unsupported => false,
-        };
+        let mut skipped = None;
+        if kind == Kind::Unsupported {
+            skipped = Some(format!("unsupported tracker scheme {}", url.scheme()));
+        } else if in_i2p {
+            match i2p {
+                I2pTrackers::Off(why) => skipped = Some((*why).to_owned()),
+                I2pTrackers::On { .. } if url.scheme() != "http" => {
+                    skipped = Some("only http:// trackers are reachable inside I2P".to_owned())
+                }
+                I2pTrackers::On { .. } => kind = Kind::I2p,
+            }
+        } else if let I2pTrackers::On {
+            clearnet: false, ..
+        } = i2p
+        {
+            skipped = Some(i2p::I2P_CLEARNET_SKIPPED.to_owned());
+        }
+        let scrapable = skipped.is_none()
+            && match kind {
+                Kind::Http | Kind::I2p => scrape::is_scrapable(&url),
+                Kind::Udp => true,
+                Kind::Unsupported => false,
+            };
         Self {
-            last_error: unsupported.then(|| format!("unsupported tracker scheme {}", url.scheme())),
-            state: if unsupported {
+            state: if skipped.is_some() {
                 TrackerState::Error
             } else {
                 TrackerState::NotContacted
             },
-            disabled: unsupported,
+            disabled: skipped.is_some(),
+            last_error: skipped,
             url,
             kind,
             seeders: None,
@@ -519,6 +546,10 @@ pub struct TorrentTrackers {
     timings: TrackerTimings,
     enabled: bool,
     key: u32,
+    i2p: I2pTrackers,
+    /// The key sent to I2P trackers: not the one the clearnet trackers see, so that the two
+    /// can't be linked.
+    i2p_key: u32,
     /// How many of the first tiers belong to the torrent (and not to the session).
     own_tiers: usize,
     inner: Mutex<Inner>,
@@ -548,7 +579,7 @@ impl TorrentTrackers {
                     continue;
                 }
                 idx.push(trackers.len());
-                trackers.push(Tracker::new(url));
+                trackers.push(Tracker::new(url, &params.i2p));
             }
             if idx.is_empty() {
                 continue;
@@ -573,6 +604,8 @@ impl TorrentTrackers {
             timings: params.timings,
             enabled: params.enabled,
             key: rand::random(),
+            i2p: params.i2p,
+            i2p_key: rand::random(),
             own_tiers: own,
             inner: Mutex::new(Inner {
                 trackers,
@@ -1145,6 +1178,11 @@ impl TorrentTrackers {
                     t.scrape_wanted = true;
                 }
                 addrs = outcome.addrs;
+                // The addresses that stand for I2P peers come from I2P trackers only: one in
+                // the answer of a clearnet tracker would let it pick I2P peers for us.
+                if t.kind != Kind::I2p {
+                    addrs.retain(|a| !is_synthetic(a));
+                }
             }
             Err(e) => {
                 t.state = TrackerState::Error;
@@ -1218,6 +1256,11 @@ impl TorrentTrackers {
                     },
                     Kind::Udp => this.announce_udp(&job).await,
                     Kind::Unsupported => JobResult::failed(anyhow::anyhow!("unsupported tracker")),
+                    Kind::I2p => JobResult {
+                        result: this.announce_i2p(&job).await,
+                        resolved: None,
+                        panicked: false,
+                    },
                 }
             };
             let res = std::panic::AssertUnwindSafe(tokio::time::timeout(timeout, work))
@@ -1427,6 +1470,10 @@ impl TorrentTrackers {
                         result: Err(anyhow::anyhow!("unsupported tracker")),
                         resolved: None,
                     },
+                    Kind::I2p => ScrapeResult {
+                        result: this.scrape_i2p(&job).await,
+                        resolved: None,
+                    },
                 }
             };
             let res = std::panic::AssertUnwindSafe(tokio::time::timeout(timeout, work))
@@ -1463,6 +1510,93 @@ impl TorrentTrackers {
         }
         let bytes = read_body_limited(response).await?;
         scrape::parse_scrape(&bytes, &self.info_hash)
+    }
+
+    /// The I2P router of the session, or the error of a torrent that has none.
+    fn i2p_transport(&self) -> anyhow::Result<&Arc<dyn i2p::I2pTransport>> {
+        match &self.i2p {
+            I2pTrackers::On { transport, .. } => Ok(transport),
+            I2pTrackers::Off(why) => bail!("{why}"),
+        }
+    }
+
+    /// Opens a stream to the I2P tracker of `url` and GETs `url` (path and query) over it.
+    async fn i2p_get(&self, url: &Url) -> anyhow::Result<Vec<u8>> {
+        let transport = self.i2p_transport()?;
+        let host = url.host_str().context("tracker URL needs a host")?;
+        let stream = transport
+            .connect(host.to_owned())
+            .await
+            .context("can't reach the tracker through I2P")?;
+        let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
+        i2p::http_get(
+            stream.stream,
+            host,
+            target,
+            transport.user_agent(),
+            MAX_HTTP_RESPONSE_BYTES,
+        )
+        .await
+    }
+
+    /// Announces to a tracker inside I2P. It is told our destination instead of an address
+    /// ("BitTorrent over I2P"), and the peers it gives are destinations.
+    async fn announce_i2p(&self, job: &Job) -> anyhow::Result<Outcome> {
+        let transport = self.i2p_transport()?;
+        let host = job.url.host_str().context("tracker URL needs a host")?;
+        let stream = transport
+            .connect(host.to_owned())
+            .await
+            .context("can't reach the tracker through I2P")?;
+        let stats = self.stats_for(job);
+        let left = stats.get_left_to_download_bytes();
+        let request = tracker_comms_http::TrackerRequest {
+            info_hash: &self.info_hash,
+            peer_id: &self.peer_id,
+            port: i2p::I2P_ANNOUNCE_PORT,
+            uploaded: stats.uploaded_bytes,
+            downloaded: stats.downloaded_bytes,
+            left,
+            compact: true,
+            no_peer_id: false,
+            event: job.event,
+            ip: None,
+            numwant: job.no_peers.then_some(0),
+            key: Some(self.i2p_key),
+            trackerid: job.tracker_id.as_deref(),
+        };
+        let mut queries = request.as_querystring();
+        queries.push_str("&ip=");
+        queries.push_str(&urlencoding::encode(&format!(
+            "{}.i2p",
+            stream.our_destination
+        )));
+        if let Some(url_query) = job.url.query() {
+            queries.push('&');
+            queries.push_str(url_query);
+        }
+        let mut url = job.url.clone();
+        url.set_query(Some(&queries));
+        let target = &url[url::Position::BeforePath..url::Position::AfterQuery];
+        let body = i2p::http_get(
+            stream.stream,
+            host,
+            target,
+            transport.user_agent(),
+            MAX_HTTP_RESPONSE_BYTES,
+        )
+        .await?;
+        let mut outcome = parse_i2p_announce(&body, transport.as_ref())?;
+        outcome.left = left;
+        info!(tracker = %host, peers = outcome.addrs.len(), "I2P tracker announce succeeded");
+        Ok(outcome)
+    }
+
+    async fn scrape_i2p(&self, job: &ScrapeJob) -> anyhow::Result<ScrapeCounts> {
+        let url = scrape::scrape_url(&job.url, &self.info_hash)
+            .context("the tracker can't be scraped")?;
+        let body = self.i2p_get(&url).await?;
+        scrape::parse_scrape(&body, &self.info_hash)
     }
 
     async fn scrape_udp(&self, job: &ScrapeJob) -> ScrapeResult {
@@ -1569,6 +1703,37 @@ fn parse_http_announce(bytes: &[u8]) -> anyhow::Result<Outcome> {
             .warning_message
             .map(|w| bounded_text(String::from_utf8_lossy(w.as_ref()).into_owned())),
         // An id too long to be a real one is not worth sending back with every announce.
+        tracker_id: response
+            .tracker_id
+            .filter(|id| id.as_ref().len() <= MAX_TRACKER_ID_LEN)
+            .map(|id| id.as_ref().to_vec()),
+    })
+}
+
+/// Parses an announce response of a tracker inside I2P, whose peers are destinations (see
+/// [`i2p::I2pPeers`]); `transport` gives them their addresses. `left` is left at 0.
+fn parse_i2p_announce(bytes: &[u8], transport: &dyn i2p::I2pTransport) -> anyhow::Result<Outcome> {
+    if let Ok((error, _)) = bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(bytes)
+    {
+        bail!(
+            "tracker returned failure. Failure reason: {}",
+            bounded_text(error.failure_reason.to_string())
+        )
+    };
+    let response = bencode::from_bytes_with_rest::<i2p::I2pTrackerResponse>(bytes)
+        .map_err(|e| e.into_kind())?
+        .0;
+    Ok(Outcome {
+        interval: response.interval.map(tracker_interval),
+        min_interval: response.min_interval.map(tracker_interval),
+        seeders: response.complete.map(count),
+        leechers: response.incomplete.map(count),
+        downloaded: response.downloaded.map(count),
+        addrs: response.peers.addrs(transport)?,
+        left: 0,
+        warning: response
+            .warning_message
+            .map(|w| bounded_text(String::from_utf8_lossy(w.as_ref()).into_owned())),
         tracker_id: response
             .tracker_id
             .filter(|id| id.as_ref().len() <= MAX_TRACKER_ID_LEN)
