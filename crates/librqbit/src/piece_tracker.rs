@@ -415,6 +415,28 @@ impl PieceTracker {
     pub fn flush_have_pieces(&mut self, flush_async: bool) -> anyhow::Result<()> {
         self.chunks.get_have_pieces_mut().flush(flush_async)
     }
+
+    /// Reserves `piece` for `peer` if it is in the queue at priority `level`, without going
+    /// through the picker. Web seeds use it to extend the piece [`Self::acquire_piece`] gave them
+    /// into a run of consecutive pieces fetched with one HTTP request. Returns whether the piece
+    /// was reserved.
+    pub fn reserve_queued_at_level(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        level: u8,
+    ) -> bool {
+        let queued = self
+            .chunks
+            .queued_pieces()
+            .get(piece.get_usize())
+            .is_some_and(|b| *b);
+        if !queued || self.chunks.piece_levels().get(piece.get_usize()) != level {
+            return false;
+        }
+        self.reserve_piece(piece, peer, false);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -1184,5 +1206,24 @@ mod tests {
             vec![(1, peer(2))]
         );
         assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer(1));
+    }
+
+    #[test]
+    fn test_reserve_queued_at_level() {
+        let mut tracker = PieceTracker::new(make_leveled_chunk_tracker(&[3, 3, 5, 0]));
+        let lengths = tracker.chunks.get_lengths().clone();
+        let p = |i| lengths.validate_piece_index(i).unwrap();
+
+        assert!(tracker.reserve_queued_at_level(p(1), peer(1), 3));
+        assert_eq!(tracker.get_inflight(p(1)).unwrap().peer, peer(1));
+        // Already in flight: not queued any more.
+        assert!(!tracker.reserve_queued_at_level(p(1), peer(2), 3));
+        // Another level.
+        assert!(!tracker.reserve_queued_at_level(p(2), peer(1), 3));
+        // Not wanted at all: level 0 is never queued.
+        assert!(!tracker.reserve_queued_at_level(p(3), peer(1), 0));
+        assert!(tracker.reserve_queued_at_level(p(2), peer(1), 5));
+        assert_eq!(tracker.release_pieces_owned_by(peer(1)), 2);
+        assert!(tracker.reserve_queued_at_level(p(1), peer(2), 3));
     }
 }
