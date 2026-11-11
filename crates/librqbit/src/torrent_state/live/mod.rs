@@ -58,6 +58,7 @@ use std::{
 use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use clone_to_owned::CloneToOwned;
+use futures::{FutureExt, future::BoxFuture};
 use librqbit_core::{
     constants::CHUNK_SIZE,
     hash_id::Id20,
@@ -913,6 +914,11 @@ impl TorrentStateLive {
         // It should be impossible to make a fatal error after pausing.
         g.fatal_errors_tx.take();
 
+        // Pieces completed since the last periodic flush would otherwise reach the fast-resume
+        // file only when the bitfield is dropped, which may never happen before the process
+        // exits.
+        g.try_flush_bitv(&self.shared, true);
+
         let piece_tracker = g
             .pieces
             .take()
@@ -927,6 +933,15 @@ impl TorrentStateLive {
             chunk_tracker,
             streams: self.streams.clone(),
         })
+    }
+
+    /// Resolves once the have-bitfield writes queued so far have reached storage.
+    pub(crate) fn wait_bitfield_flushed(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        match self.lock_read("wait_bitfield_flushed").get_chunks() {
+            Ok(chunks) => chunks.get_have_pieces().wait_flushed(),
+            // Paused already: the bitfield moved to the paused state.
+            Err(_) => futures::future::ok(()).boxed(),
+        }
     }
 
     fn on_fatal_error(&self, e: anyhow::Error) -> anyhow::Result<()> {

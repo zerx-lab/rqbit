@@ -1226,6 +1226,9 @@ impl Session {
     }
 
     /// Stop the session and all managed tasks.
+    ///
+    /// Torrents are paused first. Their fast-resume bitfields are written to storage before
+    /// this returns, unless storage takes longer than ten seconds.
     pub async fn stop(&self) {
         let torrents = self
             .db
@@ -1234,15 +1237,39 @@ impl Session {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for torrent in torrents {
+        for torrent in &torrents {
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
             }
         }
         self.cancellation_token.cancel();
+
+        // Bitfield writes run on a background task each; the runtime may go away right after
+        // this returns, taking queued writes with it.
+        let flushed = futures::future::join_all(torrents.iter().map(|t| {
+            let id = t.id();
+            t.wait_bitfield_flushed().map(move |r| (id, r))
+        }));
+        match tokio::time::timeout(Self::STOP_FLUSH_TIMEOUT, flushed).await {
+            Ok(results) => {
+                for (id, r) in results {
+                    if let Err(e) = r {
+                        warn!(id, "error writing fast-resume bitfield: {e:#}");
+                    }
+                }
+            }
+            Err(_) => warn!(
+                timeout = ?Self::STOP_FLUSH_TIMEOUT,
+                "gave up waiting for fast-resume bitfields to be written"
+            ),
+        }
+
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+
+    /// How long [`Session::stop`] waits for fast-resume bitfields to reach storage.
+    const STOP_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Run a callback given the currently managed torrents.
     pub fn with_torrents<R>(
