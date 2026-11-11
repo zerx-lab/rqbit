@@ -35,6 +35,9 @@ pub struct SerializedTorrent {
     // Written by versions that know about them; older state loads with no limits.
     #[serde(default)]
     ratelimits: LimitsConfig,
+    // The torrent's own peer limit; `None` (and older state): the session default.
+    #[serde(default)]
+    peer_limit: Option<usize>,
 }
 
 impl SerializedTorrent {
@@ -65,6 +68,7 @@ impl SerializedTorrent {
             only_files: self.only_files,
             piece_picking: self.piece_picking,
             ratelimits: self.ratelimits,
+            peer_limit: self.peer_limit,
             overwrite: true,
             ..Default::default()
         };

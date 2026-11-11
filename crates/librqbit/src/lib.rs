@@ -47,6 +47,7 @@ mod bitv;
 mod bitv_factory;
 mod choker;
 mod chunk_tracker;
+mod connection_limit;
 mod create_torrent_file;
 mod dht_utils;
 mod error;
@@ -101,8 +102,8 @@ pub use peer_connection::{PeerBackoffConfig, PeerConnectionOptions};
 pub use peer_policy::{DEFAULT_THROTTLED_UPLOAD_BPS, PeerCtx, PeerEvent, PeerPolicy, PeerVerdict};
 pub use piece_picker::PiecePicking;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
-    SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DEFAULT_PEER_LIMIT, DhtSessionConfig,
+    ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
