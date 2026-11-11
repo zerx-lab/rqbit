@@ -8,7 +8,10 @@ use crate::{
     type_aliases::FileStorage,
 };
 
-use super::{ManagedTorrentShared, TorrentMetadata, live::stats::atomic::AtomicStats, streaming::TorrentStreams};
+use super::{
+    ManagedTorrentShared, TorrentMetadata, live::stats::atomic::AtomicStats,
+    streaming::TorrentStreams,
+};
 
 pub struct TorrentStatePaused {
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -48,7 +51,9 @@ pub(crate) struct CarriedStats {
 impl CarriedStats {
     pub(crate) fn snapshot(stats: &AtomicStats) -> Self {
         Self {
-            downloaded_and_checked_bytes: stats.downloaded_and_checked_bytes.load(Ordering::Relaxed),
+            downloaded_and_checked_bytes: stats
+                .downloaded_and_checked_bytes
+                .load(Ordering::Relaxed),
             downloaded_and_checked_pieces: stats
                 .downloaded_and_checked_pieces
                 .load(Ordering::Relaxed),
@@ -71,7 +76,9 @@ impl CarriedStats {
         stats
             .uploaded_bytes
             .store(self.uploaded_bytes, Ordering::Relaxed);
-        stats.fetched_bytes.store(self.fetched_bytes, Ordering::Relaxed);
+        stats
+            .fetched_bytes
+            .store(self.fetched_bytes, Ordering::Relaxed);
         stats
             .total_piece_download_ms
             .store(self.total_piece_download_ms, Ordering::Relaxed);
