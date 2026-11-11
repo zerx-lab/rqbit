@@ -47,6 +47,7 @@ mod bitv;
 mod bitv_factory;
 mod choker;
 mod chunk_tracker;
+mod connection_limit;
 mod create_torrent_file;
 mod dht_utils;
 mod error;
@@ -70,6 +71,7 @@ mod peer_info_reader;
 mod peer_policy;
 mod piece_picker;
 mod piece_tracker;
+mod priority;
 mod read_buf;
 mod session;
 mod session_persistence;
@@ -96,26 +98,38 @@ pub use choker::UploadSlots;
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
+pub use librqbit_upnp::{
+    PortMappingMethod, PortMappingOptions, PortMappingProtocol, PortMappingState, PortMappingStatus,
+};
+/// The uTP implementation, re-exported so that [`ListenerOptions::utp_opts`] can be filled in
+/// (congestion control, buffer sizes) without depending on the crate directly.
+pub use librqbit_utp as utp;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use mse::MseMode;
 pub use peer_connection::{PeerBackoffConfig, PeerConnectionOptions};
 pub use peer_policy::{DEFAULT_THROTTLED_UPLOAD_BPS, PeerCtx, PeerEvent, PeerPolicy, PeerVerdict};
 pub use piece_picker::PiecePicking;
+pub use priority::Priority;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
-    SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DEFAULT_PEER_LIMIT, DhtSessionConfig,
+    ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
+pub use storage::MoveStorageMode;
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState,
 };
+pub use tracker_comms::{TrackerAnnounceOptions, TrackerState, TrackerStats};
 pub use type_aliases::FileInfos;
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
+/// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
+/// checked (and shown without its password) before a session is created with it.
+pub use librqbit_core::proxy::{ProxyConfig, ProxyKind, ProxyUrlError};
 pub use librqbit_core::torrent_metainfo::*;
 
 #[cfg(test)]

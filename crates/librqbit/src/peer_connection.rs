@@ -201,11 +201,9 @@ async fn connect_with_mse_fallback(
     let (ckind, read, write) =
         with_timeout("connecting", connect_timeout, connector.connect(addr)).await?;
 
-    if mse_mode == MseMode::Disabled || !matches!(ckind, ConnectionKind::Tcp) {
-        debug!(
-            ?addr,
-            "MSE skipped (disabled or non-TCP), connecting plaintext"
-        );
+    // MSE runs on any TCP stream, also when it is tunnelled through a proxy.
+    if mse_mode == MseMode::Disabled || !ckind.is_tcp_stream() {
+        debug!(?addr, "MSE skipped (disabled or uTP), connecting plaintext");
         return Ok((ckind, read, write, false));
     }
 
