@@ -611,7 +611,8 @@ impl TorrentStateLive {
             Some(options),
             self.shared.spawner.clone(),
             self.shared.connector.clone(),
-        );
+        )
+        .with_info_hash_v2(self.shared.info_hash_v2);
         let requester = handler.task_peer_chunk_requester();
 
         let res = tokio::select! {
@@ -686,7 +687,8 @@ impl TorrentStateLive {
             Some(options),
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
-        );
+        )
+        .with_info_hash_v2(state.shared.info_hash_v2);
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()
@@ -1105,7 +1107,9 @@ impl TorrentStateLive {
                 // while the torrent runs, so torrents that were already complete when added or
                 // resumed never get here. Fine under the state lock: the trackers' own lock
                 // is a leaf, they never call back into the torrent while holding it.
-                self.shared.tracker_comms.completed();
+                for trackers in self.shared.all_tracker_comms() {
+                    trackers.completed();
+                }
             }
             self.finished_notify.notify_waiters();
 
@@ -3010,11 +3014,12 @@ impl TorrentStateLive {
                 .with_context(|| format!("error checking piece={index}"))?
             {
                 true => {
-                    {
+                    let file_bytes = {
                         let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index);
-                    }
+                        let pieces = g.get_pieces_mut()?;
+                        pieces.mark_piece_hash_ok(chunk_info.piece_index);
+                        pieces.chunks().file_bytes_in_piece(chunk_info.piece_index)
+                    };
 
                     // Global piece counters.
                     let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
@@ -3030,10 +3035,12 @@ impl TorrentStateLive {
                         // This counter is used to compute "is_finished", so using
                         // stronger ordering.
                         .fetch_add(1, Ordering::Release);
+                    // Padding is not part of what we have, like in the chunk
+                    // tracker's progress.
                     state
                         .stats
                         .have_bytes
-                        .fetch_add(piece_len, Ordering::Relaxed);
+                        .fetch_add(file_bytes, Ordering::Relaxed);
                     #[allow(clippy::cast_possible_truncation)]
                     state.stats.total_piece_download_ms.fetch_add(
                         full_piece_download_time.as_millis() as u64,
