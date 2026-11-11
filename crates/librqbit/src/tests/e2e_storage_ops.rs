@@ -6,6 +6,12 @@
 //! counts reads (to tell whether a check hashed anything), can fail writes, and can hold a
 //! read or a move at a gate so that something else can happen exactly then.
 
+mod api;
+mod lifecycle;
+mod paths;
+mod seed_and_cache;
+mod streams;
+
 use std::{
     future::Future,
     net::{Ipv4Addr, SocketAddr},
@@ -332,6 +338,7 @@ struct Ctl {
     fail_writes: AtomicBool,
     read_gate: Arc<Gate>,
     move_gate: Arc<Gate>,
+    rename_gate: Arc<Gate>,
 }
 
 #[derive(Clone, Default)]
@@ -432,6 +439,7 @@ impl TorrentStorage for Instrumented {
     }
 
     fn rename_file(&self, file_id: usize, from: &Path, to: &Path) -> anyhow::Result<()> {
+        self.ctl.rename_gate.pass();
         self.inner.rename_file(file_id, from, to)
     }
 
@@ -442,6 +450,10 @@ impl TorrentStorage for Instrumented {
 
     fn finish_move_storage(&self, commit: bool) -> anyhow::Result<()> {
         self.inner.finish_move_storage(commit)
+    }
+
+    fn forget_cached_data(&self) -> anyhow::Result<()> {
+        self.inner.forget_cached_data()
     }
 }
 

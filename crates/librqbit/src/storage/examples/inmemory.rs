@@ -33,7 +33,7 @@ impl StorageFactory for InMemoryExampleStorageFactory {
         _shared: &ManagedTorrentShared,
         metadata: &TorrentMetadata,
     ) -> anyhow::Result<InMemoryExampleStorage> {
-        InMemoryExampleStorage::new(*metadata.lengths(), metadata.file_infos.clone())
+        InMemoryExampleStorage::new(metadata.lengths().clone(), metadata.file_infos.clone())
     }
 
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
@@ -109,7 +109,7 @@ impl TorrentStorage for InMemoryExampleStorage {
             repl
         };
         Ok(Box::new(Self {
-            lengths: self.lengths,
+            lengths: self.lengths.clone(),
             map: RwLock::new(map),
             file_infos: self.file_infos.clone(),
         }))
