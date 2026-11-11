@@ -2345,11 +2345,12 @@ impl PeerHandler {
                 .with_context(|| format!("error checking piece={index}"))?
             {
                 true => {
-                    {
+                    let file_bytes = {
                         let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index);
-                    }
+                        let pieces = g.get_pieces_mut()?;
+                        pieces.mark_piece_hash_ok(chunk_info.piece_index);
+                        pieces.chunks().file_bytes_in_piece(chunk_info.piece_index)
+                    };
 
                     // Global piece counters.
                     let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
@@ -2365,10 +2366,12 @@ impl PeerHandler {
                         // This counter is used to compute "is_finished", so using
                         // stronger ordering.
                         .fetch_add(1, Ordering::Release);
+                    // Padding is not part of what we have, like in the chunk
+                    // tracker's progress.
                     state
                         .stats
                         .have_bytes
-                        .fetch_add(piece_len, Ordering::Relaxed);
+                        .fetch_add(file_bytes, Ordering::Relaxed);
                     #[allow(clippy::cast_possible_truncation)]
                     state.stats.total_piece_download_ms.fetch_add(
                         full_piece_download_time.as_millis() as u64,

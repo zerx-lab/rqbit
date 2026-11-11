@@ -154,6 +154,9 @@ impl TorrentStateInitializing {
                     })
                     .enumerate()
                 {
+                    // An unreadable piece, a v2 piece whose layer is not known,
+                    // or a hybrid piece whose v1 and v2 hashes disagree are all
+                    // errors.
                     if fo.check_piece(piece_id).is_err() {
                         return true;
                     }
