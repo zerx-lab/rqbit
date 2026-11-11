@@ -145,7 +145,7 @@ impl PieceTracker {
         }
 
         // Then the queue (it holds no in-flight pieces), in the picker's order.
-        let lengths = *self.chunks.get_lengths();
+        let lengths = self.chunks.get_lengths().clone();
         let picked = req
             .picker
             .pick(
