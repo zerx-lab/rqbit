@@ -12,6 +12,7 @@ use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
 use tracing::{info, trace, warn};
 
+use crate::type_aliases::PeerStream;
 use crate::{
     api::TorrentIdOrHash,
     bitv::BitV,
@@ -57,6 +58,9 @@ pub struct TorrentStateInitializing {
     // The streams of the torrent: a recheck hands them over to the state after it, so
     // that a stream opened before keeps being woken when its pieces arrive.
     streams: Arc<TorrentStreams>,
+    // The peer stream of a start (an unpause) that found the check already running: the
+    // check goes live with it when it finishes, instead of with no peers at all.
+    pending_peer_rx: parking_lot::Mutex<Option<PeerStream>>,
 }
 
 impl TorrentStateInitializing {
@@ -79,6 +83,7 @@ impl TorrentStateInitializing {
             skip_check: false,
             carried_stats: CarriedStats::default(),
             streams: Arc::new(Default::default()),
+            pending_peer_rx: parking_lot::Mutex::new(None),
         }
     }
 
@@ -143,6 +148,17 @@ impl TorrentStateInitializing {
         self.check_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    /// Keeps the peer stream of a start that found the check already running, for when the
+    /// check goes live. A later start replaces it.
+    pub(crate) fn stash_peer_rx(&self, peer_rx: PeerStream) {
+        *self.pending_peer_rx.lock() = Some(peer_rx);
+    }
+
+    /// The peer stream kept by [`Self::stash_peer_rx`], if any.
+    pub(crate) fn take_peer_rx(&self) -> Option<PeerStream> {
+        self.pending_peer_rx.lock().take()
     }
 
     pub(crate) fn finish_check(&self) {
