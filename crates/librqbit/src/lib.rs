@@ -24,6 +24,8 @@
 //!
 
 #![warn(clippy::cast_possible_truncation)]
+// The `json!` listing of the HTTP API endpoints outgrew the default macro recursion limit.
+#![recursion_limit = "256"]
 
 macro_rules! aframe {
     ($e:expr) => {{
