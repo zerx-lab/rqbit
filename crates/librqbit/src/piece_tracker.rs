@@ -197,7 +197,7 @@ impl PieceTracker {
         P: Fn(ValidPieceIndex) -> bool,
         S: Fn(ValidPieceIndex) -> bool,
     {
-        let lengths = *self.chunks.get_lengths();
+        let lengths = self.chunks.get_lengths().clone();
         req.picker
             .pick(
                 self.chunks.queued_pieces(),

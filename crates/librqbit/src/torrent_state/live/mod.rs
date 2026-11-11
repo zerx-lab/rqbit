@@ -266,13 +266,13 @@ impl TorrentStateLive {
         let up_speed_estimator = SpeedEstimator::default();
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
-        let lengths = *paused.chunk_tracker.get_lengths();
+        let lengths = paused.chunk_tracker.get_lengths().clone();
         let selection_complete =
             Arc::new(AtomicBool::new(paused.chunk_tracker.get_hns().finished()));
 
         let picker = PiecePicker::new(
             piece_picking,
-            lengths,
+            lengths.clone(),
             &paused.metadata.file_infos,
             file_levels,
         );
@@ -309,7 +309,7 @@ impl TorrentStateLive {
                 have_bytes: AtomicU64::new(have_bytes),
                 ..Default::default()
             },
-            lengths,
+            lengths: lengths.clone(),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),

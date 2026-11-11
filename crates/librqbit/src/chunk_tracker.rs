@@ -736,7 +736,7 @@ mod tests {
         let mut ct = ChunkTracker::new(
             BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice()).into_dyn(),
             all_selected(&l),
-            l,
+            l.clone(),
             &files,
         )
         .unwrap();
@@ -802,7 +802,7 @@ mod tests {
         let mut ct = ChunkTracker::new(
             have_none(&l).into_dyn(),
             levels_of(&prio, &l, &files),
-            l,
+            l.clone(),
             &files,
         )
         .unwrap();
@@ -876,7 +876,7 @@ mod tests {
         let mut ct = ChunkTracker::new(
             have_none(&l).into_dyn(),
             levels_of(&prio, &l, &files),
-            l,
+            l.clone(),
             &files,
         )
         .unwrap();
@@ -943,7 +943,7 @@ mod tests {
         let mut ct = ChunkTracker::new(
             have_none(&l).into_dyn(),
             levels_of(&prio, &l, &files),
-            l,
+            l.clone(),
             &files,
         )
         .unwrap();
