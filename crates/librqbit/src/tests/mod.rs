@@ -1,5 +1,6 @@
 mod e2e;
 mod e2e_another_local_client;
+mod e2e_choking;
 mod e2e_have;
 mod e2e_init_pause;
 mod e2e_padded_files;

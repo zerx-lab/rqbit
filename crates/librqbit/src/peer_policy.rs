@@ -27,9 +27,7 @@ use librqbit_core::{
     lengths::{ChunkInfo, Lengths},
 };
 use parking_lot::Mutex;
-use peer_binary_protocol::Message;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::trace;
 
 use crate::{
     limits::{Limits, LimitsConfig},
@@ -73,8 +71,9 @@ pub enum PeerEvent<'a> {
         piece: u32,
     },
     /// A valid request for a block we have. It is also reported while the connection is choked
-    /// by the policy (the request is then ignored); `peer_claims_piece` tells whether the peer
-    /// had announced the piece through its bitfield or a HAVE before asking for it.
+    /// (it has no upload slot, or the policy choked it; the request is then ignored).
+    /// `peer_claims_piece` tells whether the peer had announced the piece through its bitfield
+    /// or a HAVE before asking for it.
     Request {
         piece: u32,
         begin: u32,
@@ -179,6 +178,8 @@ struct GateBlocks {
     // Sums over `blocks`.
     queued: u32,
     cancelled: u32,
+    // We unchoked the peer. A connection starts choked (BEP 3).
+    unchoked: bool,
 }
 
 /// How many accepted upload requests may wait for one connection. Requests above it are
@@ -189,14 +190,14 @@ pub(crate) const MAX_QUEUED_UPLOADS_PER_PEER: u32 = 500;
 pub(crate) const MAX_QUEUED_THROTTLED_UPLOADS_PER_PEER: u32 = 4;
 
 /// Shared between the reader side of a connection (which registers requests and cancels), the
-/// upload schedulers and the writer: it knows which accepted upload requests must still be
-/// served. A request is dropped when the peer cancelled it, or when the connection was choked or
-/// disconnected by the policy.
+/// choker, the upload schedulers and the writer: it knows which accepted upload requests must
+/// still be served. A request is dropped when the peer cancelled it, or when the connection
+/// was choked (it lost its upload slot, or the policy choked or disconnected it).
 #[derive(Default)]
 pub(crate) struct UploadGate {
     level: AtomicU8,
-    // Copies of the sums in `pending`, so that the common case (nothing cancelled, nothing
-    // choked) is decided without taking the lock.
+    // Copies of the sums in `pending`, so that the common cases (nothing waits, nothing was
+    // cancelled) are decided without taking the lock.
     queued: AtomicU32,
     cancelled: AtomicU32,
     pending: Mutex<GateBlocks>,
@@ -212,17 +213,31 @@ impl UploadGate {
         PeerVerdict::from_u8(self.level.fetch_max(to as u8, Ordering::AcqRel))
     }
 
-    /// A request for the block was accepted for upload, unless `max_queued` requests of the
-    /// connection already wait.
+    /// The peer asked for the block. `false`: the request is ignored, because the peer is
+    /// choked or `max_queued` requests of the connection already wait.
     pub fn register(&self, key: BlockKey, max_queued: u32) -> bool {
         let mut g = self.pending.lock();
-        if g.queued >= max_queued {
+        if !g.unchoked || g.queued >= max_queued {
             return false;
         }
         g.blocks.entry(key).or_default().queued += 1;
         g.queued += 1;
         self.queued.store(g.queued, Ordering::Release);
         true
+    }
+
+    /// We choke or unchoke the peer. A choke drops every request that waits: the peer asks
+    /// again once it is unchoked.
+    pub fn set_choked(&self, choked: bool) {
+        let mut g = self.pending.lock();
+        g.unchoked = !choked;
+        if choked {
+            g.blocks.clear();
+            g.queued = 0;
+            g.cancelled = 0;
+            self.queued.store(0, Ordering::Release);
+            self.cancelled.store(0, Ordering::Release);
+        }
     }
 
     /// The peer cancelled the block. Only cancels a request that is still waiting: one that
@@ -242,64 +257,52 @@ impl UploadGate {
         }
     }
 
-    fn drop_queued(&self) {
-        let mut g = self.pending.lock();
-        *g = GateBlocks::default();
-        self.queued.store(0, Ordering::Release);
-        self.cancelled.store(0, Ordering::Release);
-    }
-
-    fn is_dropped(&self, key: &BlockKey) -> bool {
-        self.level() >= PeerVerdict::Choke
-            || (self.cancelled.load(Ordering::Acquire) > 0
-                && self
-                    .pending
-                    .lock()
-                    .blocks
-                    .get(key)
-                    .is_some_and(|b| b.cancelled > 0))
-    }
-
     /// Takes one waiting request for the block out of the queue. Returns whether it has to be
-    /// served.
+    /// served: it does not when it was cancelled, or dropped by a choke.
     pub fn release(&self, key: BlockKey) -> bool {
         if self.queued.load(Ordering::Acquire) == 0 {
-            // Nothing waits (the queue was dropped by a choke, or the request never was one).
-            return self.level() < PeerVerdict::Choke;
-        }
-        let mut g = self.pending.lock();
-        let mut cancelled = false;
-        if let Some(b) = g.blocks.get_mut(&key) {
-            b.queued -= 1;
-            if b.cancelled > 0 {
-                b.cancelled -= 1;
-                cancelled = true;
-            }
-            if b.queued == 0 {
-                g.blocks.remove(&key);
-            }
-            g.queued -= 1;
-            if cancelled {
-                g.cancelled -= 1;
-            }
-            self.queued.store(g.queued, Ordering::Release);
-            self.cancelled.store(g.cancelled, Ordering::Release);
-        }
-        drop(g);
-        !cancelled && self.level() < PeerVerdict::Choke
-    }
-
-    /// For schedulers: `false` means the request was dropped (and is released).
-    pub fn keep(&self, chunk: &ChunkInfo) -> bool {
-        let key = block_key(chunk);
-        if self.is_dropped(&key) {
-            self.release(key);
             return false;
         }
-        true
+        let mut g = self.pending.lock();
+        let Some(b) = g.blocks.get_mut(&key) else {
+            return false;
+        };
+        b.queued -= 1;
+        let cancelled = b.cancelled > 0;
+        if cancelled {
+            b.cancelled -= 1;
+        }
+        if b.queued == 0 {
+            g.blocks.remove(&key);
+        }
+        g.queued -= 1;
+        if cancelled {
+            g.cancelled -= 1;
+        }
+        self.queued.store(g.queued, Ordering::Release);
+        self.cancelled.store(g.cancelled, Ordering::Release);
+        !cancelled
     }
 
-    /// For the writer, right before it reads the block from disk.
+    /// For schedulers: `false` means the request is not to be served (and is released, if it
+    /// was cancelled).
+    pub fn keep(&self, chunk: &ChunkInfo) -> bool {
+        let key = block_key(chunk);
+        if self.queued.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let cancelled = match self.pending.lock().blocks.get(&key) {
+            Some(b) => b.cancelled > 0,
+            None => return false,
+        };
+        if cancelled {
+            self.release(key);
+        }
+        !cancelled
+    }
+
+    /// For the writer, right before it reads the block from disk: takes the request out of the
+    /// queue and tells whether it still has to be served.
     pub fn should_upload(&self, chunk: &ChunkInfo) -> bool {
         self.release(block_key(chunk))
     }
@@ -369,7 +372,6 @@ pub(crate) struct PeerPolicyBinding {
     num_pieces: u32,
     // The torrent has every selected piece. Kept up to date by the torrent.
     we_are_seeding: Arc<AtomicBool>,
-    tx: UnboundedSender<WriterRequest>,
     // Disconnected is only reported for connections that got to report a handshake.
     established: AtomicBool,
 }
@@ -382,7 +384,6 @@ impl PeerPolicyBinding {
         private: bool,
         lengths: &Lengths,
         we_are_seeding: Arc<AtomicBool>,
-        tx: UnboundedSender<WriterRequest>,
     ) -> Self {
         Self {
             policy,
@@ -394,7 +395,6 @@ impl PeerPolicyBinding {
             piece_length: lengths.default_piece_length(),
             num_pieces: lengths.total_pieces(),
             we_are_seeding,
-            tx,
             established: AtomicBool::new(false),
         }
     }
@@ -428,11 +428,12 @@ impl PeerPolicyBinding {
         }
     }
 
-    /// Reports the event and applies the verdict to the connection. An error means the
-    /// connection has to be closed.
-    pub fn dispatch(&self, event: PeerEvent<'_>) -> anyhow::Result<()> {
+    /// Reports the event and raises the connection to the verdict. Returns the verdict when it
+    /// is a new one for the connection: [`PeerVerdict::Throttle`] and [`PeerVerdict::Choke`] are
+    /// then for the caller to carry out. An error means the connection has to be closed.
+    pub fn dispatch(&self, event: PeerEvent<'_>) -> anyhow::Result<Option<PeerVerdict>> {
         let Some(policy) = self.policy.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let verdict = policy.on_event(&self.ctx(), event);
         self.apply(verdict)
@@ -450,28 +451,16 @@ impl PeerPolicyBinding {
         policy.on_event(&self.ctx(), PeerEvent::Disconnected { bits });
     }
 
-    fn apply(&self, verdict: PeerVerdict) -> anyhow::Result<()> {
+    fn apply(&self, verdict: PeerVerdict) -> anyhow::Result<Option<PeerVerdict>> {
         if verdict <= self.gate.raise(verdict) {
-            return Ok(());
+            return Ok(None);
         }
-        match verdict {
-            PeerVerdict::Allow | PeerVerdict::Throttle => Ok(()),
-            PeerVerdict::Choke => {
-                self.gate.drop_queued();
-                if self
-                    .tx
-                    .send(WriterRequest::Message(Message::Choke))
-                    .is_err()
-                {
-                    trace!(addr = %self.addr, "peer is gone, not sending choke");
-                }
-                Ok(())
-            }
-            PeerVerdict::Disconnect => {
-                self.gate.drop_queued();
-                anyhow::bail!("disconnected by peer policy")
-            }
+        if verdict == PeerVerdict::Disconnect {
+            // Nothing that still waits goes out while the connection is taken down.
+            self.gate.set_choked(true);
+            anyhow::bail!("disconnected by peer policy")
         }
+        Ok(Some(verdict))
     }
 }
 
@@ -488,7 +477,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use parking_lot::Mutex;
-    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
 
@@ -519,25 +507,21 @@ mod tests {
 
     const CAP: u32 = MAX_QUEUED_UPLOADS_PER_PEER;
 
-    fn binding(
-        policy: Option<Arc<dyn PeerPolicy>>,
-    ) -> (
-        PeerPolicyBinding,
-        tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
-    ) {
-        let (tx, rx) = unbounded_channel();
-        (
-            PeerPolicyBinding::new(
-                policy,
-                Id20::new([7; 20]),
-                "[::ffff:1.2.3.4]:6881".parse().unwrap(),
-                false,
-                &lengths(),
-                Arc::new(AtomicBool::new(false)),
-                tx,
-            ),
-            rx,
+    fn binding(policy: Option<Arc<dyn PeerPolicy>>) -> PeerPolicyBinding {
+        PeerPolicyBinding::new(
+            policy,
+            Id20::new([7; 20]),
+            "[::ffff:1.2.3.4]:6881".parse().unwrap(),
+            false,
+            &lengths(),
+            Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    fn unchoked() -> UploadGate {
+        let g = UploadGate::default();
+        g.set_choked(false);
+        g
     }
 
     #[test]
@@ -573,7 +557,7 @@ mod tests {
 
     #[test]
     fn gate_cancel_drops_exactly_the_cancelled_request() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let k = (3, 0, 16384);
         assert!(g.register(k, CAP));
         g.cancel(k);
@@ -585,7 +569,7 @@ mod tests {
 
     #[test]
     fn gate_cancel_without_pending_request_is_forgotten() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let k = (3, 0, 16384);
         g.cancel(k);
         g.register(k, CAP);
@@ -602,7 +586,7 @@ mod tests {
 
     #[test]
     fn gate_cancel_after_release_is_forgotten() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let k = (1, 16384, 16384);
         g.register(k, CAP);
         assert!(g.release(k));
@@ -613,7 +597,7 @@ mod tests {
 
     #[test]
     fn gate_duplicate_requests_are_cancelled_one_by_one() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let k = (0, 0, 16384);
         g.register(k, CAP);
         g.register(k, CAP);
@@ -628,7 +612,7 @@ mod tests {
 
     #[test]
     fn gate_cancel_of_one_duplicate_keeps_the_other() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let k = (0, 0, 16384);
         g.register(k, CAP);
         g.register(k, CAP);
@@ -639,7 +623,7 @@ mod tests {
 
     #[test]
     fn gate_cancel_does_not_touch_other_blocks() {
-        let g = UploadGate::default();
+        let g = unchoked();
         g.register((0, 0, 16384), CAP);
         g.register((0, 16384, 16384), CAP);
         g.cancel((0, 0, 16384));
@@ -649,7 +633,7 @@ mod tests {
 
     #[test]
     fn gate_bounds_the_requests_waiting_per_connection() {
-        let g = UploadGate::default();
+        let g = unchoked();
         for i in 0..3 {
             assert!(g.register((i, 0, 16384), 3));
         }
@@ -667,7 +651,7 @@ mod tests {
 
     #[test]
     fn gate_counts_stay_in_step_with_cancels_and_releases() {
-        let g = UploadGate::default();
+        let g = unchoked();
         g.register((0, 0, 16384), CAP);
         g.register((1, 0, 16384), CAP);
         g.cancel((1, 0, 16384));
@@ -680,23 +664,47 @@ mod tests {
     }
 
     #[test]
-    fn gate_choke_drops_everything_queued_and_everything_later() {
-        let (b, _rx) = binding(Some(Arc::new(Recorder::default())));
-        let g = b.gate().clone();
-        g.register((0, 0, 16384), CAP);
-        g.register((1, 0, 16384), CAP);
-        b.apply(PeerVerdict::Choke).unwrap();
-        assert!(!g.release((0, 0, 16384)));
-        assert!(!g.release((1, 0, 16384)));
-        // A request that raced the choke is dropped as well.
-        g.register((2, 0, 16384), CAP);
-        assert!(!g.release((2, 0, 16384)));
+    fn gate_ignores_the_requests_of_a_choked_peer() {
+        let g = UploadGate::default();
+        let k = (0, 0, 16384);
+        assert!(!g.register(k, CAP), "a connection starts choked");
+        assert!(!g.release(k));
+        g.set_choked(false);
+        assert!(g.register(k, CAP));
+        assert!(g.release(k));
+    }
+
+    #[test]
+    fn gate_choke_drops_what_waits_and_a_block_asked_for_again_is_sent_once() {
+        let chunk = lengths()
+            .chunk_info_from_received_data(lengths().validate_piece_index(0).unwrap(), 0, 16384)
+            .unwrap();
+        let k = block_key(&chunk);
+        let g = unchoked();
+        assert!(g.register(k, CAP));
+        assert!(g.register((1, 0, 16384), CAP));
+        g.cancel((1, 0, 16384));
+        g.set_choked(true);
         assert_eq!(g.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(g.cancelled.load(Ordering::Relaxed), 0);
+        assert!(
+            !g.keep(&chunk),
+            "the scheduler skips what the choke dropped"
+        );
+        assert!(!g.register(k, CAP));
+
+        // Unchoked again, the peer repeats the request while the old one is still on its way
+        // to the writer: the block goes out for one of them only.
+        g.set_choked(false);
+        assert!(g.register(k, CAP));
+        assert!(g.keep(&chunk));
+        assert!(g.should_upload(&chunk));
+        assert!(!g.should_upload(&chunk));
     }
 
     #[test]
     fn keep_drops_and_releases_dropped_requests() {
-        let g = UploadGate::default();
+        let g = unchoked();
         let (index, offset, size) = (0, 0, 16384);
         let chunk = lengths()
             .chunk_info_from_received_data(
@@ -717,32 +725,37 @@ mod tests {
 
     #[test]
     fn verdicts_are_sticky_and_only_act_once() {
-        let (b, mut rx) = binding(Some(Arc::new(Recorder::default())));
-        b.apply(PeerVerdict::Throttle).unwrap();
-        assert_eq!(b.gate().level(), PeerVerdict::Throttle);
-        b.apply(PeerVerdict::Choke).unwrap();
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(WriterRequest::Message(Message::Choke))
-        ));
-        // Milder or equal verdicts neither downgrade nor choke again.
-        b.apply(PeerVerdict::Allow).unwrap();
-        b.apply(PeerVerdict::Throttle).unwrap();
-        b.apply(PeerVerdict::Choke).unwrap();
-        assert_eq!(b.gate().level(), PeerVerdict::Choke);
-        assert!(rx.try_recv().is_err(), "choke must be sent exactly once");
+        use PeerVerdict::*;
+        let b = binding(Some(Arc::new(Recorder::default())));
+        assert_eq!(b.apply(Throttle).unwrap(), Some(Throttle));
+        assert_eq!(b.apply(Choke).unwrap(), Some(Choke));
+        // Milder or equal verdicts neither downgrade nor act again.
+        for v in [Allow, Throttle, Choke] {
+            assert_eq!(b.apply(v).unwrap(), None);
+        }
+        assert_eq!(b.gate().level(), Choke);
         // Disconnect escalates from choke, and is an error for the caller.
+        assert!(b.apply(Disconnect).is_err());
+        assert_eq!(b.gate().level(), Disconnect);
+    }
+
+    #[test]
+    fn disconnect_drops_what_waits() {
+        let b = binding(Some(Arc::new(Recorder::default())));
+        let g = b.gate().clone();
+        g.set_choked(false);
+        assert!(g.register((0, 0, 16384), CAP));
         assert!(b.apply(PeerVerdict::Disconnect).is_err());
-        assert_eq!(b.gate().level(), PeerVerdict::Disconnect);
+        assert!(!g.release((0, 0, 16384)));
+        assert!(!g.register((1, 0, 16384), CAP));
     }
 
     #[test]
     fn dispatch_without_policy_does_nothing() {
-        let (b, mut rx) = binding(None);
+        let b = binding(None);
         assert!(!b.is_active());
-        b.dispatch(PeerEvent::Have { piece: 1 }).unwrap();
+        assert_eq!(b.dispatch(PeerEvent::Have { piece: 1 }).unwrap(), None);
         assert_eq!(b.gate().level(), PeerVerdict::Allow);
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -751,7 +764,7 @@ mod tests {
         rec.verdicts
             .lock()
             .extend([PeerVerdict::Allow, PeerVerdict::Disconnect]);
-        let (b, _rx) = binding(Some(rec.clone()));
+        let b = binding(Some(rec.clone()));
         b.dispatch(PeerEvent::Have { piece: 4 }).unwrap();
         assert!(b.dispatch(PeerEvent::Have { piece: 5 }).is_err());
         let events = rec.events.lock();
@@ -761,7 +774,7 @@ mod tests {
 
     #[test]
     fn context_describes_the_torrent() {
-        let (b, _rx) = binding(None);
+        let b = binding(None);
         let ctx = b.ctx();
         assert_eq!(ctx.total_length, 100_000);
         assert_eq!(ctx.piece_length, 32 * 1024);
@@ -776,7 +789,7 @@ mod tests {
     #[test]
     fn disconnected_is_reported_once_and_only_when_established() {
         let rec = Arc::new(Recorder::default());
-        let (b, _rx) = binding(Some(rec.clone()));
+        let b = binding(Some(rec.clone()));
         b.disconnected(None);
         assert!(rec.events.lock().is_empty(), "never handshaken");
         b.mark_established();
@@ -792,11 +805,11 @@ mod tests {
     #[test]
     fn dropping_an_established_binding_reports_disconnected() {
         let rec = Arc::new(Recorder::default());
-        let (b, _rx) = binding(Some(rec.clone()));
+        let b = binding(Some(rec.clone()));
         drop(b);
         assert!(rec.events.lock().is_empty(), "never handshaken");
 
-        let (b, _rx) = binding(Some(rec.clone()));
+        let b = binding(Some(rec.clone()));
         b.mark_established();
         drop(b);
         assert_eq!(rec.events.lock().len(), 1);
@@ -807,11 +820,10 @@ mod tests {
     fn disconnected_verdict_is_ignored() {
         let rec = Arc::new(Recorder::default());
         rec.verdicts.lock().push(PeerVerdict::Disconnect);
-        let (b, mut rx) = binding(Some(rec));
+        let b = binding(Some(rec));
         b.mark_established();
         b.disconnected(None);
         assert_eq!(b.gate().level(), PeerVerdict::Allow);
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

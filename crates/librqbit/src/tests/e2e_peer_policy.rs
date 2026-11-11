@@ -31,7 +31,7 @@ use tokio::{
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, CreateTorrentOptions, ListenerOptions,
     MseMode, PeerBackoffConfig, PeerCtx, PeerEvent, PeerPolicy, PeerVerdict, Session,
-    SessionOptions, create_torrent,
+    SessionOptions, UploadSlots, create_torrent,
     limits::LimitsConfig,
     spawn_utils::BlockingSpawner,
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging, wait_until},
@@ -463,6 +463,20 @@ impl FakePeer {
         Ok(out)
     }
 
+    /// Waits for `msg`, skipping whatever arrives before it.
+    async fn expect(&mut self, msg: Wire, within: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.recv(left).await {
+                Recv::Msg(m) if m == msg => return Ok(()),
+                Recv::Msg(_) => {}
+                Recv::Timeout => bail!("no {msg:?} in {within:?}"),
+                Recv::Closed => bail!("closed before {msg:?}"),
+            }
+        }
+    }
+
     async fn expect_closed(&mut self, within: Duration) -> anyhow::Result<Vec<Wire>> {
         let (msgs, closed) = self.collect(within).await;
         anyhow::ensure!(closed, "connection still open, received {msgs:?}");
@@ -507,6 +521,7 @@ struct SeederOpts {
     policy: Option<Arc<TestPolicy>>,
     upload_bps: Option<u32>,
     files: Option<usize>,
+    upload_slots: UploadSlots,
 }
 
 fn loopback_listener() -> ListenerOptions {
@@ -553,6 +568,7 @@ async fn start_seeder(opts: SeederOpts) -> anyhow::Result<Fixture> {
                 download_bps: None,
             },
             peer_policy: opts.policy.map(|p| p as Arc<dyn PeerPolicy>),
+            upload_slots: opts.upload_slots,
             ..Default::default()
         },
     )
@@ -1033,6 +1049,75 @@ async fn test_choke_stops_uploads_and_keeps_the_connection() -> anyhow::Result<(
     .await
 }
 
+// A peer the policy chokes gives its upload slot to the next peer, and never gets one again.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_choked_peer_gives_its_upload_slot_away() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::with_rule(|e| match e {
+            Ev::Request { piece: 1, .. } => PeerVerdict::Choke,
+            _ => PeerVerdict::Allow,
+        });
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            upload_slots: UploadSlots::Fixed(NonZeroU32::MIN),
+            ..Default::default()
+        })
+        .await?;
+        let mut a = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0020-")).await?;
+        a.interested().await?;
+        a.expect(Wire::Unchoke, Duration::from_secs(5)).await?;
+        let mut b = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0021-")).await?;
+        b.interested().await?;
+
+        a.request(1, 0, BLOCK).await?;
+        a.expect(Wire::Choke, Duration::from_secs(5)).await?;
+        b.expect(Wire::Unchoke, Duration::from_secs(5)).await?;
+        b.request(0, 0, BLOCK).await?;
+        b.expect_pieces(1, Duration::from_secs(5)).await?;
+
+        // The slot is free again, and `a` still wants it.
+        drop(b);
+        let (msgs, closed) = a.collect(Duration::from_secs(2)).await;
+        assert!(!closed);
+        assert!(!msgs.contains(&Wire::Unchoke), "{msgs:?}");
+        Ok(())
+    })
+    .await
+}
+
+// A throttled peer is unchoked like any other, but what it gets comes out of the throttled
+// queue only: it does not take an upload slot from the other peers.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_throttled_peer_takes_no_upload_slot() -> anyhow::Result<()> {
+    run(async {
+        let policy = TestPolicy::with_rule(|e| match e {
+            Ev::Handshake { peer_id, .. } if peer_id.0.starts_with(b"-TH") => PeerVerdict::Throttle,
+            _ => PeerVerdict::Allow,
+        });
+        let seed = start_seeder(SeederOpts {
+            policy: Some(policy.clone()),
+            upload_slots: UploadSlots::Fixed(NonZeroU32::MIN),
+            ..Default::default()
+        })
+        .await?;
+        let mut slow =
+            FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-TH0002-")).await?;
+        slow.interested().await?;
+        slow.expect(Wire::Unchoke, Duration::from_secs(5)).await?;
+        let mut fast =
+            FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-NO0002-")).await?;
+        fast.interested().await?;
+        fast.expect(Wire::Unchoke, Duration::from_secs(5)).await?;
+
+        slow.request(0, 0, BLOCK).await?;
+        fast.request(1, 0, BLOCK).await?;
+        slow.expect_pieces(1, Duration::from_secs(5)).await?;
+        fast.expect_pieces(1, Duration::from_secs(5)).await?;
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_disconnect_verdicts_close_the_connection_at_every_hook() -> anyhow::Result<()> {
     run(async {
@@ -1095,6 +1180,7 @@ async fn test_disconnect_verdicts_close_the_connection_at_every_hook() -> anyhow
         .await?;
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0004-")).await?;
+        peer.interested().await?;
         peer.request(0, 0, BLOCK).await?;
         let msgs = peer.expect_closed(Duration::from_secs(5)).await?;
         assert!(
@@ -1115,6 +1201,7 @@ async fn test_disconnect_verdicts_close_the_connection_at_every_hook() -> anyhow
         .await?;
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0004-")).await?;
+        peer.interested().await?;
         peer.request(0, 0, BLOCK).await?;
         peer.request(0, BLOCK, BLOCK).await?;
         let (msgs, closed) = peer.collect(Duration::from_secs(5)).await;
@@ -1152,6 +1239,8 @@ async fn test_throttled_peer_does_not_hold_back_normal_peers() -> anyhow::Result
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-TH0001-")).await?;
         let mut fast =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-NO0001-")).await?;
+        slow.interested().await?;
+        fast.interested().await?;
         slow.request(0, 0, BLOCK).await?;
         slow.request(0, BLOCK, BLOCK).await?;
         // Make sure the throttled requests are in front of the normal ones.
@@ -1203,6 +1292,7 @@ async fn test_throttled_peers_share_the_default_rate() -> anyhow::Result<()> {
         // 32 KiB/s: two blocks out of the initial burst, then one every half a second.
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0005-")).await?;
+        peer.interested().await?;
         // At most as many requests as a throttled connection may have waiting (more would be
         // dropped, by design), so every round waits for its blocks.
         let started = Instant::now();
@@ -1254,6 +1344,7 @@ async fn test_throttled_request_cancelled_in_the_throttle_queue_is_not_sent() ->
             .set_throttled_upload_bps(NonZeroU32::new(BLOCK));
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0005-")).await?;
+        peer.interested().await?;
         let mut batch = Vec::new();
         for (piece, begin) in [(0, 0), (0, BLOCK), (1, 0)] {
             batch.extend(FakePeer::request_frame(piece, begin, BLOCK));
@@ -1824,6 +1915,7 @@ async fn test_throttled_peer_cannot_queue_unbounded_requests() -> anyhow::Result
         .await?;
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0013-")).await?;
+        peer.interested().await?;
         peer.send_raw(&flood(10_000)).await?;
         wait_for(
             "every request reported",
@@ -1874,6 +1966,8 @@ async fn test_throttled_peers_take_turns() -> anyhow::Result<()> {
         .await?;
         let mut a = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0014-")).await?;
         let mut b = FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0015-")).await?;
+        a.interested().await?;
+        b.interested().await?;
         // The first peer floods the queue before the second one asks for anything.
         a.send_raw(&flood(2_000)).await?;
         wait_for(
