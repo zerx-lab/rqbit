@@ -98,7 +98,10 @@ pub use error::{Error, Result};
 pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use choker::UploadSlots;
-pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
+pub use create_torrent_file::{
+    CreateTorrentCancelled, CreateTorrentOptions, CreateTorrentProgress,
+    CreateTorrentProgressCallback, CreateTorrentResult, auto_piece_length, create_torrent,
+};
 pub use dht;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use librqbit_upnp::{
@@ -129,7 +132,13 @@ pub use webseed::{WebSeedState, WebSeedStats};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
+/// Version-independent piece verification (v1 SHA-1, v2 merkle, both for hybrid torrents),
+/// re-exported so that an embedder can check data on disk against a torrent's metadata.
+pub use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 pub use librqbit_core::magnet::*;
+/// The format of a torrent ([`CreateTorrentOptions::version`]) and the version-independent
+/// piece verifier.
+pub use librqbit_core::metainfo_v2::{PieceVerdict, PieceVerifier, TorrentVersion};
 pub use librqbit_core::peer_id::*;
 /// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
 /// checked (and shown without its password) before a session is created with it.

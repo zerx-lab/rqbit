@@ -74,6 +74,10 @@ pub(super) enum Wire {
     HaveNone,
     RejectRequest(u32, u32, u32),
     AllowedFast(u32),
+    // BitTorrent v2 (BEP 52), the payloads as sent.
+    HashRequest(Vec<u8>),
+    Hashes(Vec<u8>),
+    HashReject(Vec<u8>),
 }
 
 pub(super) enum Recv {
@@ -244,6 +248,9 @@ impl FakePeer {
             (0x0F, 0) => Wire::HaveNone,
             (0x10, 12) => Wire::RejectRequest(be32(p), be32(&p[4..]), be32(&p[8..])),
             (0x11, 4) => Wire::AllowedFast(be32(p)),
+            (21, 48) => Wire::HashRequest(p.to_vec()),
+            (22, n) if n >= 48 => Wire::Hashes(p.to_vec()),
+            (23, 48) => Wire::HashReject(p.to_vec()),
             (id, _) => Wire::Other(id),
         })
     }
