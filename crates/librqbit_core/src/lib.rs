@@ -8,6 +8,7 @@ pub mod magnet;
 pub mod merkle;
 pub mod metainfo_v2;
 pub mod peer_id;
+pub mod proxy;
 pub mod spawn_utils;
 pub mod speed_estimator;
 pub mod torrent_metainfo;

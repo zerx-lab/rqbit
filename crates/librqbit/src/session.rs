@@ -37,9 +37,7 @@ use crate::{
     storage::{
         BoxStorageFactory, StorageFactoryExt, TorrentStorage, filesystem::FilesystemStorageFactory,
     },
-    stream_connect::{
-        ConnectionKind, ConnectionOptions, SocksProxyConfig, StreamConnector, StreamConnectorArgs,
-    },
+    stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
@@ -66,6 +64,7 @@ use librqbit_core::{
     directories::get_configuration_directory,
     magnet::Magnet,
     peer_id::generate_azereus_style,
+    proxy::ProxyConfig,
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
 };
@@ -709,6 +708,21 @@ impl Session {
                 None => None,
             };
 
+            // One parsed proxy for every consumer. Tracker traffic always goes through it;
+            // peers and the DHT only with `proxy_peer_connections`.
+            let proxy_config = opts
+                .connect
+                .as_ref()
+                .and_then(|s| s.proxy_url.as_deref())
+                .map(ProxyConfig::parse)
+                .transpose()
+                .context("error parsing the proxy URL")?;
+            let peer_proxy = proxy_config.clone().filter(|_| {
+                opts.connect
+                    .as_ref()
+                    .is_none_or(|c| c.proxy_peer_connections)
+            });
+
             let mut listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
@@ -724,7 +738,20 @@ impl Session {
                 None
             };
 
-            let dht = if let Some(dht_config) = opts.dht.take() {
+            // The DHT follows the peers: behind their proxy it goes through UDP ASSOCIATE, and a
+            // proxy that can't relay UDP turns it off rather than letting it talk directly.
+            let dht_config = opts.dht.take().filter(|_| match peer_proxy.as_ref() {
+                Some(proxy) if !proxy.kind().can_relay_udp() => {
+                    warn!(
+                        proxy = %proxy,
+                        "DHT disabled: {} proxies cannot relay UDP",
+                        proxy.kind().scheme()
+                    );
+                    false
+                }
+                _ => true,
+            });
+            let dht = if let Some(dht_config) = dht_config {
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_with_config(
                         persistence_config,
@@ -735,6 +762,7 @@ impl Session {
                             cancellation_token: Some(token.clone()),
                             bind_device: bind_device.as_ref(),
                             enforce_node_id: dht_config.enforce_node_id,
+                            proxy: peer_proxy.as_ref(),
                             ..Default::default()
                         },
                     )
@@ -748,6 +776,7 @@ impl Session {
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
                         enforce_node_id: dht_config.enforce_node_id,
+                        proxy: peer_proxy.as_ref(),
                         ..Default::default()
                     })
                     .await
@@ -820,24 +849,14 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let proxy_url = opts.connect.as_ref().and_then(|s| s.proxy_url.as_ref());
-            let proxy_config = match proxy_url {
-                Some(pu) => Some(
-                    SocksProxyConfig::parse(pu)
-                        .with_context(|| format!("error parsing proxy url {pu}"))?,
-                ),
-                None => None,
-            };
-
             let client_name_and_version = opts
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
-                    let proxy = reqwest::Proxy::all(proxy_url)
-                        .context("error creating socks5 proxy for HTTP")?;
-                    crate::http_client::client_builder().proxy(proxy)
+                let builder = if let Some(proxy_config) = proxy_config.as_ref() {
+                    crate::http_client::client_builder()
+                        .proxy(crate::http_client::proxy(proxy_config)?)
                 } else {
                     #[allow(unused_mut)]
                     let mut b = crate::http_client::client_builder();
@@ -857,7 +876,7 @@ impl Session {
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
-                    socks_proxy_config: proxy_config,
+                    proxy: peer_proxy.clone(),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
@@ -888,9 +907,14 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                .await
-                .context("error creating UDP tracker client")?;
+            // UDP trackers follow the HTTP ones: always through the proxy.
+            let udp_tracker_client = UdpTrackerClient::new_with_proxy(
+                token.clone(),
+                bind_device.as_ref(),
+                proxy_config.as_ref(),
+            )
+            .await
+            .context("error creating UDP tracker client")?;
 
             let lsd = {
                 if opts.disable_local_service_discovery {
@@ -1315,7 +1339,9 @@ impl Session {
                 .utp_socket
                 .is_some()
                 .then_some((PortMappingProtocol::Udp, port)),
-            dht.map(|dht| (PortMappingProtocol::Udp, dht.listen_addr().port())),
+            // Behind a proxy the DHT has no port of its own to map.
+            dht.filter(|dht| dht.proxy().is_none())
+                .map(|dht| (PortMappingProtocol::Udp, dht.listen_addr().port())),
         ];
         let opts = listen
             .port_mapping
