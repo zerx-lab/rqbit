@@ -410,16 +410,16 @@ impl TorrentStateLive {
         &self.up_speed_estimator
     }
 
+    /// Hands over an incoming connection. `permits`: the torrent's and the session's, taken
+    /// while the connection was checked; `None` if either limit was reached, which refuses it.
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
+        permits: Option<PeerPermits>,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let options = &self.shared.options;
-        let Some(permits) =
-            PeerPermits::try_acquire(&options.peer_slots, &options.session_peer_slots)
-        else {
+        let Some(permits) = permits else {
             debug!("limit of live peers reached, dropping incoming peer");
             self.peers.with_peer(checked_peer.addr, |p| {
                 atomic_inc(&p.stats.counters.incoming_connections);
@@ -527,15 +527,7 @@ impl TorrentStateLive {
                             continue;
                         }
                         res = session.throttled_upload.acquire(NonZeroU32::new(ci.size).unwrap()) => {
-                            if let Err(e) = res {
-                                warn!(
-                                    id = self.shared.id,
-                                    info_hash = ?self.shared.info_hash,
-                                    "dropping a throttled upload request: {e:#}"
-                                );
-                                gate.should_upload(&ci);
-                                continue;
-                            }
+                            res?;
                         }
                     }
                 }
@@ -595,6 +587,7 @@ impl TorrentStateLive {
             counters,
             choker,
             first_message_received: AtomicBool::new(false),
+            waits_for_rate: AtomicBool::new(false),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
@@ -666,6 +659,7 @@ impl TorrentStateLive {
             counters,
             choker,
             first_message_received: AtomicBool::new(false),
+            waits_for_rate: AtomicBool::new(false),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
@@ -1321,6 +1315,9 @@ struct PeerHandler {
 
     first_message_received: AtomicBool,
 
+    // The requester holds back the next request until the download rate limits allow it.
+    waits_for_rate: AtomicBool,
+
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
@@ -1431,6 +1428,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // for one of our upload slots has nothing to say, and neither has one we wait for.
         if self.requested_inflight_count() != Some(0) {
             return false;
+        }
+        // Nothing asked of it because we pace ourselves: any other peer would wait the same.
+        if self.waits_for_rate.load(Ordering::Relaxed) {
+            return true;
         }
         let they_wait = self.choker.waits_for_slot();
         if self.state.is_finished_and_no_active_streams() {
@@ -1575,6 +1576,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    // Both the torrent's and the session's download limits.
+    async fn wait_for_download_rate(&self, len: u32) -> crate::Result<()> {
+        let Some(len) = NonZeroU32::new(len) else {
+            return Ok(());
+        };
+        self.state
+            .shared
+            .options
+            .ratelimits
+            .prepare_for_download(len)
+            .await?;
+        if let Some(session) = self.state.torrent().session.upgrade() {
+            session.ratelimits.prepare_for_download(len).await?;
+        }
+        Ok(())
+    }
+
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
         let peers = &self.state.peers;
         let handle = self.addr;
@@ -2127,19 +2145,12 @@ impl PeerHandler {
 
                 aframe!(self.wait_for_request_slot()).await;
 
-                self.state
-                    .shared
-                    .options
-                    .ratelimits
-                    .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                    .await?;
-
-                if let Some(session) = self.state.torrent().session.upgrade() {
-                    session
-                        .ratelimits
-                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                        .await?;
-                }
+                // At a low rate this can take longer than the read timeout, while the peer has
+                // nothing to send: its silence is excused meanwhile.
+                self.waits_for_rate.store(true, Ordering::Relaxed);
+                let paced = self.wait_for_download_rate(request.length).await;
+                self.waits_for_rate.store(false, Ordering::Relaxed);
+                paced?;
 
                 aframe!(self.wait_for_request_slot()).await;
 

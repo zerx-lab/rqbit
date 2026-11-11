@@ -19,13 +19,16 @@ use tokio::time::timeout;
 
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, CreateTorrentOptions, ListenerOptions,
-    Session, SessionOptions, SessionPersistenceConfig,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig,
     api::TorrentIdOrHash,
     create_torrent,
     limits::LimitsConfig,
     spawn_utils::BlockingSpawner,
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging, wait_until},
-    torrent_state::ManagedTorrentHandle,
+    torrent_state::{
+        ManagedTorrentHandle,
+        peer::stats::snapshot::{PeerStatsFilter, PeerStatsFilterState},
+    },
 };
 
 const PIECE_LEN: u32 = 64 * 1024;
@@ -205,9 +208,9 @@ fn at_least(bytes: u64, rate: u32) -> Duration {
     Duration::from_secs_f64(bytes.saturating_sub(free) as f64 / f64::from(rate) * 0.8)
 }
 
-// The old limit is 1 KiB/s: a block parked on it needs 15 more seconds, the rest of the
-// torrent hours. Finishing within this shows that both the parked transfer and the next ones
-// follow the lifted limit.
+// The old limit is 1 KiB/s: the rest of the torrent would take more than an hour at it.
+// Finishing within this shows that both the transfer parked on the old bucket and the next
+// ones follow the lifted limit.
 const LIFTED_WITHIN: Duration = Duration::from_secs(12);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -331,6 +334,54 @@ async fn test_torrent_download_limit_changes_while_downloading() -> anyhow::Resu
         timeout(LIFTED_WITHIN, client.handle.wait_until_completed())
             .await
             .context("the transfer kept the old limit")??;
+        Ok(())
+    })
+    .await
+}
+
+// A download limit below one block per read timeout: the requester waits longer than the
+// timeout before it may ask for the next block, and the seeder, asked for nothing, sends
+// nothing meanwhile. That silence is ours, so the connection is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_slow_download_limit_keeps_a_quiet_seeder() -> anyhow::Result<()> {
+    run(async {
+        let seed = start_seeder().await?;
+        // A 16 KiB block every 4 seconds, twice the read timeout.
+        let client = start_client(
+            &seed,
+            AddTorrentOptions {
+                ratelimits: LimitsConfig {
+                    upload_bps: None,
+                    download_bps: bps(4 * KIB),
+                },
+                peer_opts: Some(PeerConnectionOptions {
+                    read_write_timeout: Some(Duration::from_secs(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        wait_for(
+            "three blocks at 4 KiB/s",
+            || client.fetched() >= 3 * 16 * 1024,
+            Duration::from_secs(40),
+        )
+        .await?;
+
+        let live = client.handle.live().context("client is live")?;
+        let peers = live.per_peer_stats_snapshot(PeerStatsFilter {
+            state: PeerStatsFilterState::All,
+        });
+        let seeder = peers
+            .peers
+            .get(&seed.addr.to_string())
+            .context("the client knows the seeder")?;
+        assert_eq!(
+            (seeder.counters.connections, seeder.counters.errors),
+            (1, 0),
+            "the connection to the seeder was dropped while the client paced itself"
+        );
         Ok(())
     })
     .await
