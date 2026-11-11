@@ -40,7 +40,7 @@ use crate::{
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
+        TorrentMetadata, TorrentStateLive, alt_info_hash, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
     vectored_traits::AsyncReadVectoredIntoCompat,
@@ -62,10 +62,11 @@ use itertools::Itertools;
 use librqbit_core::{
     crate_version,
     directories::get_configuration_directory,
+    hash_id::Id32,
     magnet::Magnet,
     peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
-    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
+    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, compute_info_hashes},
 };
 use librqbit_lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use librqbit_utp::BindDevice;
@@ -319,6 +320,8 @@ pub struct AddTorrentOptions {
 
 pub struct ListOnlyResponse {
     pub info_hash: Id20,
+    /// BEP 52: the SHA-256 info hash of a v2 or hybrid torrent.
+    pub info_hash_v2: Option<Id32>,
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
     pub only_files: Option<Vec<usize>>,
     pub output_folder: PathBuf,
@@ -584,6 +587,7 @@ pub(crate) struct CheckedIncomingConnection {
 
 struct InternalAddResult {
     info_hash: Id20,
+    info_hash_v2: Option<Id32>,
     metadata: Option<TorrentMetadata>,
     trackers: Vec<url::Url>,
     name: Option<String>,
@@ -1007,18 +1011,21 @@ impl Session {
         }
 
         // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
-        // so the MSE acceptor can resolve the peer's obfuscated info hash.
+        // so the MSE acceptor can resolve the peer's obfuscated info hash. A hybrid
+        // torrent has two: peers of the v2 swarm use its truncated v2 hash.
         let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
             .db
             .read()
             .torrents
             .values()
-            .map(|torrent| {
-                let info_hash = torrent.info_hash().0;
+            .flat_map(|torrent| {
+                std::iter::once(torrent.info_hash()).chain(torrent.shared().alt_info_hash())
+            })
+            .map(|info_hash| {
                 let mut h = Sha1::new();
                 h.update(b"req2");
-                h.update(&info_hash);
-                (h.finish(), info_hash)
+                h.update(&info_hash.0);
+                (h.finish(), info_hash.0)
             })
             .collect();
 
@@ -1108,7 +1115,7 @@ impl Session {
             .read()
             .torrents
             .iter()
-            .find(|(_, t)| t.info_hash() == h.info_hash)
+            .find(|(_, t)| t.shared().has_info_hash(h.info_hash))
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
 
@@ -1279,6 +1286,7 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
+                        info_hash_v2: None,
                         trackers: magnet
                             .trackers
                             .into_iter()
@@ -1324,6 +1332,7 @@ impl Session {
 
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
+                        info_hash_v2: torrent.meta.info_hash_v2,
                         metadata: Some(TorrentMetadata::new(
                             torrent.meta.validate_with_piece_layers()?,
                             torrent.torrent_bytes,
@@ -1394,18 +1403,21 @@ impl Session {
     ) -> anyhow::Result<AddTorrentResponse> {
         let InternalAddResult {
             info_hash,
+            info_hash_v2,
             metadata,
             trackers,
             name,
         } = add_res;
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
+        let announce = !opts.paused && !opts.list_only;
 
         let make_peer_rx = || {
             self.make_peer_rx(
                 info_hash,
+                alt_info_hash(info_hash, info_hash_v2),
                 trackers.clone(),
-                !opts.paused && !opts.list_only,
+                announce,
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
@@ -1414,14 +1426,14 @@ impl Session {
 
         let mut seen_peers = Vec::new();
 
-        let (metadata, peer_rx) = {
+        let (metadata, info_hash_v2, peer_rx) = {
             match metadata {
                 Some(metadata) => {
                     let mut peer_rx = None;
-                    if !opts.paused && !opts.list_only {
+                    if announce {
                         peer_rx = make_peer_rx();
                     }
-                    (metadata, peer_rx)
+                    (metadata, info_hash_v2, peer_rx)
                 }
                 None => {
                     let peer_rx = make_peer_rx().context(
@@ -1436,14 +1448,28 @@ impl Session {
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
                     seen_peers = resolved_magnet.seen_peers.clone();
-                    let peer_rx = Some(
-                        merge_streams(
-                            resolved_magnet.peer_rx,
-                            futures::stream::iter(resolved_magnet.seen_peers),
+                    let mut peer_rx = merge_streams(
+                        resolved_magnet.peer_rx,
+                        futures::stream::iter(resolved_magnet.seen_peers),
+                    )
+                    .boxed();
+                    // A v1 magnet link may turn out to be a hybrid torrent: join its v2 swarm
+                    // too.
+                    let resolved_v2 = info_hash_v2.or(resolved_magnet.info_hash_v2);
+                    let is_private = resolved_magnet.metadata.info.info().private;
+                    if info_hash_v2.is_none()
+                        && let Some(alt) = alt_info_hash(info_hash, resolved_v2)
+                        && let Some(alt_rx) = self.swarm_peer_rx(
+                            alt,
+                            self.announce_trackers(alt, trackers.clone(), is_private),
+                            announce,
+                            opts.force_tracker_interval,
+                            is_private,
                         )
-                        .boxed(),
-                    );
-                    (resolved_magnet.metadata, peer_rx)
+                    {
+                        peer_rx = merge_streams(peer_rx, alt_rx).boxed();
+                    }
+                    (resolved_magnet.metadata, resolved_v2, Some(peer_rx))
                 }
             }
         };
@@ -1472,6 +1498,7 @@ impl Session {
         if opts.list_only {
             return Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
                 info_hash,
+                info_hash_v2,
                 info: metadata.info,
                 only_files,
                 output_folder,
@@ -1499,8 +1526,10 @@ impl Session {
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
+            // The same content may arrive under another of its hashes (a hybrid torrent added
+            // once from a v1 magnet link and once from a v2 one).
             if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
-                if t.info_hash() == info_hash {
+                if t.shared().is_same_torrent(info_hash, info_hash_v2) {
                     Some((*eid, t.clone()))
                 } else {
                     None
@@ -1522,6 +1551,7 @@ impl Session {
                 id,
                 span,
                 info_hash,
+                info_hash_v2,
                 trackers: trackers.into_iter().collect(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
@@ -1599,7 +1629,7 @@ impl Session {
         match id {
             TorrentIdOrHash::Id(id) => self.db.read().torrents.get(&id).cloned(),
             TorrentIdOrHash::Hash(id) => self.db.read().torrents.iter().find_map(|(_, v)| {
-                if v.info_hash() == id {
+                if v.shared().has_info_hash(id) {
                     Some(v.clone())
                 } else {
                     None
@@ -1617,7 +1647,7 @@ impl Session {
                 .torrents
                 .values()
                 .find_map(|v| {
-                    if v.info_hash() == h {
+                    if v.shared().has_info_hash(h) {
                         Some(v.id())
                     } else {
                         None
@@ -1704,6 +1734,7 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
+            t.shared().alt_info_hash(),
             t.shared().trackers.iter().cloned().collect(),
             announce,
             t.shared().options.force_tracker_interval,
@@ -1712,14 +1743,80 @@ impl Session {
         )
     }
 
-    // Get a peer stream from both DHT and trackers.
+    // Get a peer stream from both DHT and trackers. A hybrid torrent lives in two swarms, so
+    // it is announced and looked up under both `info_hash` and `alt_info_hash` (its truncated
+    // v2 hash), and the peers of both feed the same stream.
+    #[allow(clippy::too_many_arguments)]
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
-        mut trackers: Vec<url::Url>,
+        alt_info_hash: Option<Id20>,
+        trackers: Vec<url::Url>,
         announce: bool,
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
+        is_private: bool,
+    ) -> Option<PeerStream> {
+        let trackers = self.announce_trackers(info_hash, trackers, is_private);
+
+        let alt_rx = alt_info_hash.and_then(|alt| {
+            self.swarm_peer_rx(
+                alt,
+                trackers.clone(),
+                announce,
+                force_tracker_interval,
+                is_private,
+            )
+        });
+        let main_rx = self.swarm_peer_rx(
+            info_hash,
+            trackers,
+            announce,
+            force_tracker_interval,
+            is_private,
+        );
+
+        let initial_peers_rx = if initial_peers.is_empty() {
+            None
+        } else {
+            Some(futures::stream::iter(initial_peers))
+        };
+        merge_two_optional_streams(
+            merge_two_optional_streams(main_rx, alt_rx),
+            initial_peers_rx,
+        )
+    }
+
+    // The trackers a torrent announces to: its own, then the session-wide ones.
+    fn announce_trackers(
+        &self,
+        info_hash: Id20,
+        mut trackers: Vec<url::Url>,
+        is_private: bool,
+    ) -> Vec<url::Url> {
+        if self.disable_trackers {
+            trackers.clear();
+        }
+
+        if is_private && trackers.len() > 1 {
+            warn!(
+                ?info_hash,
+                "private trackers are not fully implemented, so using only the first tracker"
+            );
+            trackers.truncate(1);
+        } else if !self.disable_trackers {
+            trackers.extend(self.trackers.iter().cloned());
+        }
+        trackers
+    }
+
+    // The peers of one swarm: DHT, trackers and local service discovery for `info_hash`.
+    fn swarm_peer_rx(
+        self: &Arc<Self>,
+        info_hash: Id20,
+        trackers: Vec<url::Url>,
+        announce: bool,
+        force_tracker_interval: Option<Duration>,
         is_private: bool,
     ) -> Option<PeerStream> {
         let dht_rx = if is_private {
@@ -1738,20 +1835,6 @@ impl Session {
             })
         };
 
-        if self.disable_trackers {
-            trackers.clear();
-        }
-
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
-        } else if !self.disable_trackers {
-            trackers.extend(self.trackers.iter().cloned());
-        }
-
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
             session: self.clone(),
@@ -1767,18 +1850,7 @@ impl Session {
             self.udp_tracker_client.clone(),
         );
 
-        let initial_peers_rx = if initial_peers.is_empty() {
-            None
-        } else {
-            Some(futures::stream::iter(initial_peers))
-        };
-        merge_two_optional_streams(
-            merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
-            ),
-            lsd_rx,
-        )
+        merge_two_optional_streams(merge_two_optional_streams(dht_rx, tracker_rx), lsd_rx)
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
@@ -1908,6 +1980,7 @@ impl Session {
                 seen,
             } => {
                 trace!(?info, "received result from DHT");
+                let (_, info_hash_v2) = compute_info_hashes(&info, info_bytes.as_ref());
                 let info = info.validate()?;
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
@@ -1915,6 +1988,7 @@ impl Session {
                         torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
                         info_bytes.0,
                     )?,
+                    info_hash_v2,
                     peer_rx: rx,
                     seen_peers: {
                         let seen = seen.into_iter().collect_vec();
@@ -1975,6 +2049,8 @@ impl Session {
 
 pub(crate) struct ResolveMagnetResult {
     pub metadata: TorrentMetadata,
+    /// BEP 52: the SHA-256 info hash, if the metadata is that of a v2 or hybrid torrent.
+    pub info_hash_v2: Option<Id32>,
     pub peer_rx: PeerStream,
     pub seen_peers: Vec<SocketAddr>,
 }
@@ -2023,7 +2099,7 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
     fn get(&self) -> tracker_comms::TrackerCommsStats {
         let mt = self.session.with_torrents(|torrents| {
             for (_, mt) in torrents {
-                if mt.info_hash() == self.info_hash {
+                if mt.shared().has_info_hash(self.info_hash) {
                     return Some(mt.clone());
                 }
             }
