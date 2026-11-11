@@ -7,7 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -48,7 +48,7 @@ use crate::{
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
         MoveInProgress, Quiesced, StorageLoan, StorageLocation, TorrentMetadata, TorrentStateLive,
-        initializing::TorrentStateInitializing,
+        alt_info_hash, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
     vectored_traits::AsyncReadVectoredIntoCompat,
@@ -71,11 +71,12 @@ use itertools::Itertools;
 use librqbit_core::{
     crate_version,
     directories::get_configuration_directory,
+    hash_id::Id32,
     magnet::Magnet,
     peer_id::generate_azereus_style,
     proxy::ProxyConfig,
     spawn_utils::spawn_with_cancel,
-    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
+    torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, compute_info_hashes},
 };
 use librqbit_lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use librqbit_upnp::{
@@ -396,6 +397,15 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub piece_priorities: Option<Vec<(u32, u8)>>,
 
+    /// Super seeding (BEP 16, "initial seeding"): once the torrent has every selected piece,
+    /// the connections made from then on are not told what we have. Each peer is shown one
+    /// piece at a time, the rarest one, and the next only after the previous one has shown up
+    /// at another peer, so that every piece we upload is a new one for the swarm. While the
+    /// torrent still needs pieces it downloads normally. Can be changed later with
+    /// [`Session::set_super_seeding`].
+    #[serde(default)]
+    pub super_seeding: bool,
+
     /// Web seeds (BEP 19 HTTP(S) URLs) to download from, added to the ones the torrent or the
     /// magnet link carries (or, with `replace_web_seeds`, used instead of them). Unusable and
     /// duplicate URLs are skipped. Can be changed later with [`Session::add_web_seed`] and
@@ -416,6 +426,8 @@ pub struct AddTorrentOptions {
 
 pub struct ListOnlyResponse {
     pub info_hash: Id20,
+    /// BEP 52: the SHA-256 info hash of a v2 or hybrid torrent.
+    pub info_hash_v2: Option<Id32>,
     pub info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
     pub only_files: Option<Vec<usize>>,
     pub output_folder: PathBuf,
@@ -722,6 +734,7 @@ pub(crate) struct CheckedIncomingConnection {
 
 struct InternalAddResult {
     info_hash: Id20,
+    info_hash_v2: Option<Id32>,
     metadata: Option<TorrentMetadata>,
     tiers: Vec<Vec<url::Url>>,
     name: Option<String>,
@@ -1247,18 +1260,21 @@ impl Session {
         }
 
         // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
-        // so the MSE acceptor can resolve the peer's obfuscated info hash.
+        // so the MSE acceptor can resolve the peer's obfuscated info hash. A hybrid
+        // torrent has two: peers of the v2 swarm use its truncated v2 hash.
         let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
             .db
             .read()
             .torrents
             .values()
-            .map(|torrent| {
-                let info_hash = torrent.info_hash().0;
+            .flat_map(|torrent| {
+                std::iter::once(torrent.info_hash()).chain(torrent.shared().alt_info_hash())
+            })
+            .map(|info_hash| {
                 let mut h = Sha1::new();
                 h.update(b"req2");
-                h.update(&info_hash);
-                (h.finish(), info_hash)
+                h.update(&info_hash.0);
+                (h.finish(), info_hash.0)
             })
             .collect();
 
@@ -1348,7 +1364,7 @@ impl Session {
             .read()
             .torrents
             .iter()
-            .find(|(_, t)| t.info_hash() == h.info_hash)
+            .find(|(_, t)| t.shared().has_info_hash(h.info_hash))
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
         if !torrent.shared().net.admits(&addr) {
@@ -1534,8 +1550,10 @@ impl Session {
             .collect::<Vec<_>>();
         let mut stopped = Vec::with_capacity(torrents.len());
         for torrent in &torrents {
-            torrent.shared().tracker_comms.stop();
-            stopped.push(torrent.shared().tracker_comms.wait_stopped());
+            for trackers in torrent.shared().all_tracker_comms() {
+                trackers.stop();
+                stopped.push(trackers.wait_stopped());
+            }
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
             }
@@ -1640,6 +1658,7 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
+                        info_hash_v2: None,
                         tiers: magnet
                             .trackers
                             .into_iter()
@@ -1698,8 +1717,9 @@ impl Session {
 
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
+                        info_hash_v2: torrent.meta.info_hash_v2,
                         metadata: Some(TorrentMetadata::new(
-                            torrent.meta.info.data.validate()?,
+                            torrent.meta.validate_with_piece_layers()?,
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
@@ -1766,6 +1786,7 @@ impl Session {
     ) -> anyhow::Result<AddTorrentResponse> {
         let InternalAddResult {
             info_hash,
+            info_hash_v2,
             metadata,
             tiers,
             name,
@@ -1779,32 +1800,50 @@ impl Session {
             self.i2p.as_ref().map(|r| r.options()),
             tiers.iter().flatten(),
         );
+        let announce = !opts.paused && !opts.list_only;
 
         // A torrent that is managed already is not looked for a second time: the trackers
         // can't tell a second instance from the running one, so its announces (and above all
         // its `stopped`) would count for the running torrent.
-        let already_managed = self
-            .db
-            .read()
-            .torrents
-            .iter()
-            .find_map(|(eid, t)| (t.info_hash() == info_hash).then(|| (*eid, t.clone())));
+        let already_managed = self.db.read().torrents.iter().find_map(|(eid, t)| {
+            t.shared()
+                .is_same_torrent(info_hash, info_hash_v2)
+                .then(|| (*eid, t.clone()))
+        });
         if let Some((id, handle)) = &already_managed
             && !opts.list_only
         {
             return Ok(AddTorrentResponse::AlreadyManaged(*id, handle.clone()));
         }
 
+        // A hybrid torrent is announced under its truncated v2 hash too, by trackers of its
+        // own: an instance of `TorrentTrackers` speaks for exactly one info hash.
+        let mut alt_tracker_comms = alt_info_hash(info_hash, info_hash_v2).map(|alt| {
+            (
+                alt,
+                self.new_torrent_trackers(
+                    alt,
+                    tiers.clone(),
+                    private,
+                    opts.force_tracker_interval,
+                    net,
+                ),
+            )
+        });
         let tracker_comms =
             self.new_torrent_trackers(info_hash, tiers, private, opts.force_tracker_interval, net);
         if already_managed.is_some() {
             tracker_comms.suppress_stopped();
+            if let Some((_, alt)) = &alt_tracker_comms {
+                alt.suppress_stopped();
+            }
         }
         let make_peer_rx = || {
             self.make_peer_rx(
                 info_hash,
                 &tracker_comms,
-                !opts.paused && !opts.list_only,
+                alt_tracker_comms.as_ref().map(|(h, t)| (*h, t)),
+                announce,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
                 net,
@@ -1813,14 +1852,14 @@ impl Session {
 
         let mut seen_peers = Vec::new();
 
-        let (metadata, peer_rx) = {
+        let (metadata, info_hash_v2, peer_rx) = {
             match metadata {
                 Some(metadata) => {
                     let mut peer_rx = None;
-                    if !opts.paused && !opts.list_only {
+                    if announce {
                         peer_rx = make_peer_rx();
                     }
-                    (metadata, peer_rx)
+                    (metadata, info_hash_v2, peer_rx)
                 }
                 None => {
                     let peer_rx = make_peer_rx().context(
@@ -1845,14 +1884,36 @@ impl Session {
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
                     seen_peers = resolved_magnet.seen_peers.clone();
-                    let peer_rx = Some(
-                        merge_streams(
-                            resolved_magnet.peer_rx,
-                            futures::stream::iter(resolved_magnet.seen_peers),
-                        )
-                        .boxed(),
-                    );
-                    (resolved_magnet.metadata, peer_rx)
+                    let mut peer_rx = merge_streams(
+                        resolved_magnet.peer_rx,
+                        futures::stream::iter(resolved_magnet.seen_peers),
+                    )
+                    .boxed();
+                    // A v1 magnet link may turn out to be a hybrid torrent: join its v2 swarm
+                    // too.
+                    let resolved_v2 = info_hash_v2.or(resolved_magnet.info_hash_v2);
+                    let is_private = resolved_magnet.metadata.info.info().private;
+                    if alt_tracker_comms.is_none()
+                        && let Some(alt) = alt_info_hash(info_hash, resolved_v2)
+                    {
+                        let alt_trackers = self.new_torrent_trackers(
+                            alt,
+                            tracker_comms.own_tiers(),
+                            is_private,
+                            opts.force_tracker_interval,
+                            net,
+                        );
+                        if let Some(alt_rx) = self.swarm_peer_rx(
+                            alt,
+                            &alt_trackers,
+                            announce,
+                            is_private || !net.uses_clearnet(),
+                        ) {
+                            peer_rx = merge_streams(peer_rx, alt_rx).boxed();
+                        }
+                        alt_tracker_comms = Some((alt, alt_trackers));
+                    }
+                    (resolved_magnet.metadata, resolved_v2, Some(peer_rx))
                 }
             }
         };
@@ -1881,6 +1942,7 @@ impl Session {
         if opts.list_only {
             return Ok(AddTorrentResponse::ListOnly(ListOnlyResponse {
                 info_hash,
+                info_hash_v2,
                 info: metadata.info,
                 only_files,
                 output_folder,
@@ -1930,8 +1992,10 @@ impl Session {
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
+            // The same content may arrive under another of its hashes (a hybrid torrent added
+            // once from a v1 magnet link and once from a v2 one).
             if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
-                if t.info_hash() == info_hash {
+                if t.shared().is_same_torrent(info_hash, info_hash_v2) {
                     Some((*eid, t.clone()))
                 } else {
                     None
@@ -1939,6 +2003,9 @@ impl Session {
             }) {
                 // Added meanwhile: this instance did look for peers, see above.
                 tracker_comms.suppress_stopped();
+                if let Some((_, alt)) = &alt_tracker_comms {
+                    alt.suppress_stopped();
+                }
                 return Ok(AddTorrentResponse::AlreadyManaged(id, handle));
             }
             if let Some(existing) = g.torrents.get(&id) {
@@ -1956,8 +2023,10 @@ impl Session {
                 id,
                 span,
                 info_hash,
+                info_hash_v2,
                 trackers: tracker_comms.own_tiers().into_iter().flatten().collect(),
                 tracker_comms: tracker_comms.clone(),
+                alt_tracker_comms: alt_tracker_comms.map(|(_, t)| t),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
                 storage_factory,
@@ -1983,14 +2052,18 @@ impl Session {
                     upload_slots: self.upload_slots,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
+                    super_seeding: AtomicBool::new(opts.super_seeding),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
+                // An I2P torrent without mixed mode never contacts web seeds (clearnet), but
+                // that is not the torrent's own setting: it is not persisted as such.
                 web_seeds: WebSeeds::new(
                     web_seeds,
-                    self.disable_web_seeds || opts.disable_web_seeds || !net.uses_clearnet(),
+                    opts.disable_web_seeds,
+                    self.disable_web_seeds || !net.uses_clearnet(),
                 ),
                 net,
                 location: RwLock::new(StorageLocation {
@@ -2022,6 +2095,7 @@ impl Session {
                     state: ManagedTorrentState::Initializing(initializing),
                     priorities,
                     piece_picking: opts.piece_picking,
+                    storage_on_loan: false,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
@@ -2058,7 +2132,7 @@ impl Session {
         match id {
             TorrentIdOrHash::Id(id) => self.db.read().torrents.get(&id).cloned(),
             TorrentIdOrHash::Hash(id) => self.db.read().torrents.iter().find_map(|(_, v)| {
-                if v.info_hash() == id {
+                if v.shared().has_info_hash(id) {
                     Some(v.clone())
                 } else {
                     None
@@ -2076,7 +2150,7 @@ impl Session {
                 .torrents
                 .values()
                 .find_map(|v| {
-                    if v.info_hash() == h {
+                    if v.shared().has_info_hash(h) {
                         Some(v.id())
                     } else {
                         None
@@ -2087,7 +2161,9 @@ impl Session {
         // Tell the trackers while the numbers are still the torrent's own.
         let to_stop = self.db.read().torrents.get(&id).cloned();
         if let Some(t) = to_stop {
-            t.shared().tracker_comms.stop();
+            for trackers in t.shared().all_tracker_comms() {
+                trackers.stop();
+            }
         }
         let removed = self
             .db
@@ -2183,11 +2259,16 @@ impl Session {
         announce: bool,
     ) -> Option<PeerStream> {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
+        let shared = t.shared();
+        let alt = shared
+            .alt_info_hash()
+            .zip(shared.alt_tracker_comms.as_ref());
         self.make_peer_rx(
             t.info_hash(),
-            &t.shared().tracker_comms,
+            &shared.tracker_comms,
+            alt,
             announce,
-            t.shared().options.initial_peers.clone(),
+            shared.options.initial_peers.clone(),
             is_private,
             t.shared().net,
         )
@@ -2240,11 +2321,14 @@ impl Session {
         )
     }
 
-    // Get a peer stream from both DHT and trackers.
+    // Get a peer stream from both DHT and trackers. A hybrid torrent lives in two swarms, so
+    // it is announced and looked up under both `info_hash` and its truncated v2 hash (`alt`,
+    // with the trackers that announce that hash), and the peers of both feed the same stream.
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
         trackers: &Arc<TorrentTrackers>,
+        alt: Option<(Id20, &Arc<TorrentTrackers>)>,
         announce: bool,
         mut initial_peers: Vec<SocketAddr>,
         is_private: bool,
@@ -2254,6 +2338,30 @@ impl Session {
         // them.
         let is_private = is_private || !net.uses_clearnet();
         initial_peers.retain(|a| net.admits(a));
+        let alt_rx = alt.and_then(|(alt_hash, alt_trackers)| {
+            self.swarm_peer_rx(alt_hash, alt_trackers, announce, is_private)
+        });
+        let main_rx = self.swarm_peer_rx(info_hash, trackers, announce, is_private);
+
+        let initial_peers_rx = if initial_peers.is_empty() {
+            None
+        } else {
+            Some(futures::stream::iter(initial_peers))
+        };
+        merge_two_optional_streams(
+            merge_two_optional_streams(main_rx, alt_rx),
+            initial_peers_rx,
+        )
+    }
+
+    // The peers of one swarm: DHT, trackers and local service discovery for `info_hash`.
+    fn swarm_peer_rx(
+        self: &Arc<Self>,
+        info_hash: Id20,
+        trackers: &Arc<TorrentTrackers>,
+        announce: bool,
+        is_private: bool,
+    ) -> Option<PeerStream> {
         let dht_rx = if is_private {
             None
         } else {
@@ -2272,18 +2380,7 @@ impl Session {
 
         let tracker_rx = trackers.peer_stream();
 
-        let initial_peers_rx = if initial_peers.is_empty() {
-            None
-        } else {
-            Some(futures::stream::iter(initial_peers))
-        };
-        merge_two_optional_streams(
-            merge_two_optional_streams(
-                merge_two_optional_streams(dht_rx, tracker_rx),
-                initial_peers_rx,
-            ),
-            lsd_rx,
-        )
+        merge_two_optional_streams(merge_two_optional_streams(dht_rx, tracker_rx), lsd_rx)
     }
 
     pub(crate) async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
@@ -2331,7 +2428,9 @@ impl Session {
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         // Wait for a storage operation to finish instead of changing the state under it.
         let _storage_op = handle.lock_storage_op().await?;
-        handle.shared().tracker_comms.stop();
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.stop();
+        }
         handle.pause()?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
@@ -2450,7 +2549,9 @@ impl Session {
     ///
     /// If anything fails, what was moved is moved back and the torrent keeps working at the
     /// old place; the error says what went wrong (and which files the undo couldn't put back,
-    /// if any). Moving to the current folder does nothing. Waits for a storage operation
+    /// if any). Moving to the current folder does nothing, however the new folder names it
+    /// (a link to it, `..`, a relative path, another case where the filesystem ignores
+    /// case): the torrent keeps its folder as it was. Waits for a storage operation
     /// already running on the torrent; deleting the torrent or stopping the session during
     /// the move undoes it.
     ///
@@ -2482,7 +2583,16 @@ impl Session {
             .load_full()
             .context("torrent is not resolved")?;
         let _storage_op = handle.lock_storage_op().await?;
-        if new_output_folder == handle.output_folder() {
+        let old_folder = handle.output_folder();
+        // Another name of the current folder moves nothing, and the folder keeps the name it
+        // had: the other one may depend on a link or a directory that goes away later, or on
+        // the current directory of the process.
+        if new_output_folder == old_folder
+            || handle.shared.spawner.block_in_place(|| {
+                crate::storage::filesystem::relocate::resolve_path(&new_output_folder)
+                    == crate::storage::filesystem::relocate::resolve_path(&old_folder)
+            })
+        {
             return Ok(());
         }
         let files = metadata
@@ -2736,7 +2846,10 @@ impl Session {
     /// often this is called. Fails when the torrent is not running (paused or still checking
     /// its files), as it is not announcing then.
     pub fn reannounce(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        handle.shared().tracker_comms.reannounce()
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.reannounce()?;
+        }
+        Ok(())
     }
 
     /// Asks the trackers of the torrent that are in use right now how many seeders and
@@ -2744,7 +2857,10 @@ impl Session {
     /// [`ManagedTorrent::trackers`] shortly after. A tracker is never asked more often than
     /// once every 10 seconds. Fails when the torrent is not running.
     pub fn scrape(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
-        handle.shared().tracker_comms.scrape()
+        for trackers in handle.shared().all_tracker_comms() {
+            trackers.scrape()?;
+        }
+        Ok(())
     }
 
     pub async fn update_only_files(
@@ -2821,6 +2937,22 @@ impl Session {
         limit: Option<usize>,
     ) -> anyhow::Result<()> {
         handle.set_peer_limit(limit);
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// Turn super seeding (BEP 16) on or off for a torrent, in any state (see
+    /// [`AddTorrentOptions::super_seeding`]). It is kept across pause / resume and persisted.
+    ///
+    /// Turning it on affects the connections made from then on, once the torrent has every
+    /// selected piece; the peers connected already keep what they were told. Turning it off
+    /// sends the connections in the mode a `Have` for every piece they were not shown yet.
+    pub async fn set_super_seeding(
+        &self,
+        handle: &ManagedTorrentHandle,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        handle.set_super_seeding(enabled);
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
@@ -2952,6 +3084,7 @@ impl Session {
                 seen,
             } => {
                 trace!(?info, "received result from DHT");
+                let (_, info_hash_v2) = compute_info_hashes(&info, info_bytes.as_ref());
                 let info = info.validate()?;
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
@@ -2959,6 +3092,7 @@ impl Session {
                         torrent_file_from_info_bytes(info_bytes.as_ref(), tiers)?,
                         info_bytes.0,
                     )?,
+                    info_hash_v2,
                     peer_rx: rx,
                     seen_peers: {
                         let seen = seen.into_iter().collect_vec();
@@ -3019,6 +3153,8 @@ impl Session {
 
 pub(crate) struct ResolveMagnetResult {
     pub metadata: TorrentMetadata,
+    /// BEP 52: the SHA-256 info hash, if the metadata is that of a v2 or hybrid torrent.
+    pub info_hash_v2: Option<Id32>,
     pub peer_rx: PeerStream,
     pub seen_peers: Vec<SocketAddr>,
 }
@@ -3079,7 +3215,7 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
         };
         let mt = session.with_torrents(|torrents| {
             for (_, mt) in torrents {
-                if mt.info_hash() == self.info_hash {
+                if mt.shared().has_info_hash(self.info_hash) {
                     return Some(mt.clone());
                 }
             }

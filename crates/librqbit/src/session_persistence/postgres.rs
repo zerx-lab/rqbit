@@ -39,8 +39,11 @@ struct TorrentsTableRecord {
     // Explicit piece priorities as two parallel arrays: piece index and level.
     piece_priority_pieces: Vec<i64>,
     piece_priority_levels: Vec<i16>,
+    super_seeding: bool,
     // NULL in rows written before web seeds: the torrent's own are used.
     web_seeds: Option<Vec<String>>,
+    // Web seeds are disabled for this torrent.
+    disable_web_seeds: bool,
     // A Session::move_storage the process stopped in the middle of, as JSON. NULL if none.
     move_in_progress: Option<String>,
 }
@@ -116,7 +119,9 @@ impl TorrentsTableRecord {
                     .zip(self.piece_priority_levels)
                     .filter_map(|(p, l)| Some((u32::try_from(p).ok()?, u8::try_from(l).ok()?)))
                     .collect(),
+                super_seeding: self.super_seeding,
                 web_seeds: self.web_seeds,
+                disable_web_seeds: self.disable_web_seeds,
                 move_in_progress,
             },
         ))
@@ -194,7 +199,13 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_levels SMALLINT[] NOT NULL DEFAULT '{}'"
         );
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS super_seeding BOOLEAN NOT NULL DEFAULT FALSE"
+        );
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS web_seeds TEXT[]");
+        exec!(
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS disable_web_seeds BOOLEAN NOT NULL DEFAULT false"
+        );
         exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS move_in_progress TEXT");
 
         Ok(Self { pool })
@@ -218,8 +229,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, web_seeds, move_in_progress)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, super_seeding, web_seeds, move_in_progress, disable_web_seeds)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
@@ -258,8 +269,10 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(file_priority_column(torrent))
             .bind(pieces)
             .bind(levels)
+            .bind(torrent.super_seeding())
             .bind(torrent.web_seed_urls())
             .bind(move_in_progress_column(torrent)?)
+            .bind(torrent.web_seeds_disabled_for_torrent())
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -276,7 +289,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
     }
 
     async fn get(&self, id: TorrentId) -> anyhow::Result<SerializedTorrent> {
-        let row = sqlx::query_as::<_, TorrentsTableRecord>("SELECT * FROM torrents WHERE id = ?")
+        let row = sqlx::query_as::<_, TorrentsTableRecord>("SELECT * FROM torrents WHERE id = $1")
             .bind::<i32>(id.try_into()?)
             .fetch_one(&self.pool)
             .await
@@ -297,7 +310,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         // The output folder changes with Session::move_storage, the file paths with
         // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, web_seeds = $13, move_in_progress = $14 WHERE id = $15",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, super_seeding = $13, web_seeds = $14, move_in_progress = $15, disable_web_seeds = $16 WHERE id = $17",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -321,8 +334,10 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(file_priority_column(torrent))
         .bind(pieces)
         .bind(levels)
+        .bind(torrent.super_seeding())
         .bind(torrent.web_seed_urls())
         .bind(move_in_progress_column(torrent)?)
+        .bind(torrent.web_seeds_disabled_for_torrent())
         .bind::<i32>(id.try_into()?)
         .execute(&self.pool)
         .await
@@ -513,5 +528,296 @@ impl BitVFactory for PostgresSessionStorage {
             }
         }
         Ok(())
+    }
+}
+
+// These tests need a Postgres server: they run against RQBIT_TEST_POSTGRES_URL and are skipped
+// (with a note) when it isn't set. Each test works in a schema of its own, so they can run in
+// parallel against one database.
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, sync::Arc};
+
+    use futures::TryStreamExt;
+    use sqlx::{AssertSqlSafe, PgPool};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::{
+        AddTorrent, AddTorrentOptions, CreateTorrentOptions, MoveStorageMode, Session,
+        SessionOptions, create_torrent, spawn_utils::BlockingSpawner,
+        tests::test_util::create_default_random_dir_with_torrents, torrent_state::MoveInProgress,
+    };
+
+    const ENV: &str = "RQBIT_TEST_POSTGRES_URL";
+
+    // A schema of its own for one test, dropped (with everything in it) when done.
+    struct Scratch {
+        admin: PgPool,
+        schema: String,
+        url: String,
+    }
+
+    impl Scratch {
+        async fn new(test: &str) -> anyhow::Result<Option<Self>> {
+            let Ok(base) = std::env::var(ENV) else {
+                eprintln!("skipping {test}: set {ENV} to run the Postgres tests");
+                return Ok(None);
+            };
+            // The name is made of a fixed test name and the process id, so it is safe to splice
+            // into the statements (identifiers can't be bound as parameters).
+            let schema = format!("rqbit_test_{test}_{}", std::process::id());
+            let admin = PgPool::connect(&base).await.context("connecting")?;
+            sqlx::query(AssertSqlSafe(format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE"
+            )))
+            .execute(&admin)
+            .await?;
+            sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+                .execute(&admin)
+                .await?;
+            // Every connection of the store resolves unqualified names in the test's schema.
+            let sep = if base.contains('?') { '&' } else { '?' };
+            let url = format!("{base}{sep}options=-c%20search_path%3D{schema}");
+            Ok(Some(Self { admin, schema, url }))
+        }
+
+        async fn store(&self) -> anyhow::Result<PostgresSessionStorage> {
+            PostgresSessionStorage::new(&self.url).await
+        }
+
+        async fn drop_schema(self) -> anyhow::Result<()> {
+            sqlx::query(AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&self.admin)
+            .await?;
+            Ok(())
+        }
+    }
+
+    // A paused torrent of two files, stored in the folder it was created from.
+    struct Fixture {
+        _dir: TempDir,
+        data: PathBuf,
+        session: Arc<Session>,
+        handle: ManagedTorrentHandle,
+    }
+
+    async fn fixture(name: &str) -> anyhow::Result<Fixture> {
+        let data = create_default_random_dir_with_torrents(2, 4096, Some(name));
+        let torrent = create_torrent(
+            data.path(),
+            CreateTorrentOptions {
+                piece_length: Some(1024),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await?;
+        let session = Session::new_with_opts(
+            data.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: None,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent.as_bytes()?),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    overwrite: true,
+                    output_folder: Some(data.path().to_str().context("utf-8")?.to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("into_handle")?;
+        handle.wait_until_initialized().await?;
+        Ok(Fixture {
+            data: data.path().to_owned(),
+            _dir: data,
+            session,
+            handle,
+        })
+    }
+
+    fn file_name(handle: &ManagedTorrentHandle, index: usize) -> anyhow::Result<PathBuf> {
+        handle.with_metadata(|m| m.file_infos[index].relative_filename.clone())
+    }
+
+    async fn load_all(
+        store: &PostgresSessionStorage,
+    ) -> anyhow::Result<Vec<(TorrentId, SerializedTorrent)>> {
+        store.stream_all().await?.try_collect().await
+    }
+
+    // A move and a rename reach the row through update_metadata, and a torrent stored after
+    // them is written with them; both read back the same through get and stream_all.
+    #[tokio::test]
+    async fn test_moved_and_renamed_round_trip() -> anyhow::Result<()> {
+        let Some(scratch) = Scratch::new("moved_renamed").await? else {
+            return Ok(());
+        };
+        let store = scratch.store().await?;
+        let f = fixture("rqbit_pg_moved_renamed").await?;
+        let id = store.next_id().await?;
+        store.store(id, &f.handle).await?;
+        assert_eq!(store.get(id).await?.output_folder, f.data);
+        assert!(store.get(id).await?.renamed_files.is_empty());
+
+        let moved = f.data.join("moved");
+        f.session
+            .move_storage(&f.handle, moved.clone(), MoveStorageMode::FailIfExists)
+            .await?;
+        f.session
+            .rename_file(&f.handle, 1, PathBuf::from("nested/renamed.data"))
+            .await?;
+        assert!(moved.join("nested/renamed.data").exists());
+        store.update_metadata(id, &f.handle).await?;
+
+        let expected_renames = BTreeMap::from([(1, PathBuf::from("nested/renamed.data"))]);
+        let st = store.get(id).await?;
+        assert_eq!(st.output_folder, moved);
+        assert_eq!(st.renamed_files, expected_renames);
+        assert!(st.move_in_progress.is_none());
+        assert_eq!(st.info_hash, f.handle.info_hash());
+
+        // A fresh insert carries the same location.
+        let id2 = store.next_id().await?;
+        store.store(id2, &f.handle).await?;
+        let all = load_all(&store).await?;
+        assert_eq!(all.len(), 2);
+        for (_, st) in &all {
+            assert_eq!(st.output_folder, moved);
+            assert_eq!(st.renamed_files, expected_renames);
+        }
+
+        // Renaming back to the torrent's own name empties the column again.
+        let original = file_name(&f.handle, 1)?;
+        f.session.rename_file(&f.handle, 1, original).await?;
+        store.update_metadata(id, &f.handle).await?;
+        assert!(store.get(id).await?.renamed_files.is_empty());
+
+        scratch.drop_schema().await
+    }
+
+    // The marker of a move in progress is written, read back exactly and cleared.
+    #[tokio::test]
+    async fn test_move_in_progress_round_trip() -> anyhow::Result<()> {
+        let Some(scratch) = Scratch::new("move_marker").await? else {
+            return Ok(());
+        };
+        let store = scratch.store().await?;
+        let f = fixture("rqbit_pg_move_marker").await?;
+        let id = store.next_id().await?;
+        store.store(id, &f.handle).await?;
+        assert!(store.get(id).await?.move_in_progress.is_none());
+
+        let marker = MoveInProgress {
+            to: f.data.join("elsewhere"),
+            files: vec![file_name(&f.handle, 0)?, file_name(&f.handle, 1)?],
+        };
+        f.handle.shared.location.write().move_in_progress = Some(marker.clone());
+        store.update_metadata(id, &f.handle).await?;
+        let st = store.get(id).await?;
+        assert_eq!(st.move_in_progress.as_ref(), Some(&marker));
+        // The folder is still the one moved from: that is what recovery starts from.
+        assert_eq!(st.output_folder, f.data);
+        assert_eq!(
+            st.interrupted_move(),
+            Some(
+                marker
+                    .files
+                    .iter()
+                    .map(|rel| (f.data.join(rel), marker.to.join(rel)))
+                    .collect()
+            )
+        );
+        // A row inserted while the marker is set has it as well.
+        let id2 = store.next_id().await?;
+        store.store(id2, &f.handle).await?;
+        assert_eq!(store.get(id2).await?.move_in_progress, Some(marker));
+
+        f.handle.shared.location.write().move_in_progress = None;
+        store.update_metadata(id, &f.handle).await?;
+        assert!(store.get(id).await?.move_in_progress.is_none());
+        assert!(store.get(id).await?.interrupted_move().is_none());
+
+        scratch.drop_schema().await
+    }
+
+    // A table created before renames, limits, priorities and the move marker existed: the store
+    // adds the columns and loads the old row with their defaults, and can update it.
+    #[tokio::test]
+    async fn test_table_from_before_storage_ops() -> anyhow::Result<()> {
+        let Some(scratch) = Scratch::new("legacy").await? else {
+            return Ok(());
+        };
+        let legacy = PgPool::connect(&scratch.url).await?;
+        for q in [
+            "CREATE SEQUENCE IF NOT EXISTS torrents_id AS integer",
+            "CREATE TABLE IF NOT EXISTS torrents (
+              id INTEGER PRIMARY KEY DEFAULT nextval('torrents_id'),
+              info_hash BYTEA NOT NULL,
+              torrent_bytes BYTEA NOT NULL,
+              trackers TEXT[] NOT NULL,
+              output_folder TEXT NOT NULL,
+              only_files INTEGER[],
+              is_paused BOOLEAN NOT NULL
+            )",
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS have_bitfield BYTEA",
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS sequential BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS first_last_pieces_first BOOLEAN NOT NULL DEFAULT FALSE",
+        ] {
+            sqlx::query(q).execute(&legacy).await?;
+        }
+        let info_hash = [7u8; 20];
+        sqlx::query(
+            "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first)
+            VALUES (5, $1, $2, $3, '/old/folder', $4, TRUE, TRUE, FALSE)",
+        )
+        .bind(&info_hash[..])
+        .bind(&b"torrent"[..])
+        .bind(vec!["udp://tracker.example:80".to_owned()])
+        .bind(vec![0i32, 2])
+        .execute(&legacy)
+        .await?;
+        legacy.close().await;
+
+        let store = scratch.store().await?;
+        let check = |st: &SerializedTorrent| {
+            assert_eq!(st.info_hash, Id20::new(info_hash));
+            assert_eq!(&st.torrent_bytes[..], b"torrent");
+            assert_eq!(st.output_folder, Path::new("/old/folder"));
+            assert_eq!(st.only_files, Some(vec![0, 2]));
+            assert!(st.is_paused);
+            assert!(st.piece_picking.sequential);
+            assert!(st.trackers.contains("udp://tracker.example:80"));
+            assert!(st.renamed_files.is_empty());
+            assert!(st.move_in_progress.is_none());
+            assert!(st.ratelimits.upload_bps.is_none() && st.ratelimits.download_bps.is_none());
+            assert!(st.peer_limit.is_none());
+            assert!(st.file_priorities.is_none());
+            assert!(st.piece_priorities.is_empty());
+        };
+        check(&store.get(5).await?);
+        let all = load_all(&store).await?;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, 5);
+        check(&all[0].1);
+
+        // Opening the store again (the columns now exist) changes nothing.
+        drop(store);
+        let store = scratch.store().await?;
+        check(&store.get(5).await?);
+
+        scratch.drop_schema().await
     }
 }

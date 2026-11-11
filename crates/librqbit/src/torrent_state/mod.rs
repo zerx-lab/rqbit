@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -23,7 +23,7 @@ use buffers::ByteBufOwned;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use librqbit_core::hash_id::Id20;
+use librqbit_core::hash_id::{Id20, Id32};
 use librqbit_core::lengths::Lengths;
 
 use librqbit_core::spawn_utils::spawn_with_cancel;
@@ -124,6 +124,9 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) priorities: Priorities,
     // Kept here, not in the live state, so it survives pause / resume.
     pub(crate) piece_picking: PiecePicking,
+    // Set while a storage operation has the storage out of the state (see `storage_ops`), so
+    // that a stream reading meanwhile waits for it instead of reading from what's left.
+    pub(crate) storage_on_loan: bool,
 }
 
 pub(crate) struct ManagedTorrentOptions {
@@ -160,6 +163,10 @@ pub(crate) struct ManagedTorrentOptions {
     pub upload_slots: UploadSlots,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
+    /// Super seeding (BEP 16) as set by the user. It lives here, not in the live state, so that
+    /// it survives pause / resume and storage operations; the live state reads it for every new
+    /// connection.
+    pub super_seeding: AtomicBool,
 }
 
 impl ManagedTorrentOptions {
@@ -222,10 +229,16 @@ impl TorrentMetadata {
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
+    /// BEP 52: SHA-256 of the info dictionary of a v2 or hybrid torrent. (`info_hash` is its
+    /// truncation for a v2-only torrent, and the SHA-1 for a hybrid one.)
+    pub info_hash_v2: Option<Id32>,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
     /// Talks to the trackers of the torrent. See [`tracker_comms::TorrentTrackers`].
     pub(crate) tracker_comms: Arc<tracker_comms::TorrentTrackers>,
+    /// The trackers that announce the truncated v2 hash of a hybrid torrent
+    /// ([`Self::alt_info_hash`]); the same tiers as `tracker_comms`.
+    pub(crate) alt_tracker_comms: Option<Arc<tracker_comms::TorrentTrackers>>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -266,9 +279,44 @@ pub(crate) struct MoveInProgress {
     pub files: Vec<PathBuf>,
 }
 
+/// The other 20-byte info hash a hybrid torrent is known by, next to its v1 hash `info_hash`:
+/// the truncated v2 hash, which peers of the v2 swarm use in handshakes and announces.
+pub(crate) fn alt_info_hash(info_hash: Id20, info_hash_v2: Option<Id32>) -> Option<Id20> {
+    info_hash_v2
+        .map(|h| h.truncate_for_dht())
+        .filter(|h| *h != info_hash)
+}
+
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The other 20-byte info hash a hybrid torrent is known by: its truncated v2 hash, which
+    /// peers of the v2 swarm use in handshakes and which we announce next to `info_hash`.
+    pub fn alt_info_hash(&self) -> Option<Id20> {
+        alt_info_hash(self.info_hash, self.info_hash_v2)
+    }
+
+    /// Whether `h` is one of the 20-byte info hashes of the torrent (for a hybrid torrent:
+    /// the v1 hash or the truncated v2 hash).
+    pub fn has_info_hash(&self, h: Id20) -> bool {
+        h == self.info_hash || self.alt_info_hash() == Some(h)
+    }
+
+    /// Whether the torrent is the one identified by `info_hash` (a v1 or truncated v2 hash) or
+    /// by the full v2 hash `info_hash_v2`: either one is enough.
+    pub(crate) fn is_same_torrent(&self, info_hash: Id20, info_hash_v2: Option<Id32>) -> bool {
+        self.has_info_hash(info_hash)
+            || info_hash_v2.is_some_and(|v2| self.info_hash_v2 == Some(v2))
+    }
+
+    /// Everything that talks to trackers for the torrent: the trackers of `info_hash`, then
+    /// those of the truncated v2 hash of a hybrid torrent.
+    pub(crate) fn all_tracker_comms(
+        &self,
+    ) -> impl Iterator<Item = &Arc<tracker_comms::TorrentTrackers>> {
+        std::iter::once(&self.tracker_comms).chain(self.alt_tracker_comms.as_ref())
     }
 
     /// The folder the files of the torrent are stored under right now.
@@ -386,6 +434,11 @@ impl ManagedTorrent {
         self.shared.info_hash
     }
 
+    /// BEP 52: the SHA-256 info hash of a v2 or hybrid torrent.
+    pub fn info_hash_v2(&self) -> Option<Id32> {
+        self.shared.info_hash_v2
+    }
+
     /// The files with a non-zero priority, or None when every file that is not padding has one.
     pub fn only_files(&self) -> Option<Vec<usize>> {
         let metadata = self.metadata.load();
@@ -452,6 +505,22 @@ impl ManagedTorrent {
         options
             .peer_slots
             .set_limit(Some(limit.unwrap_or(options.default_peer_limit)));
+    }
+
+    /// Whether super seeding (BEP 16) is on, as set with [`crate::Session::set_super_seeding`]
+    /// or [`crate::AddTorrentOptions::super_seeding`]. It is only active while the torrent has
+    /// every selected piece, and then for the connections made from that moment on: those
+    /// see one piece at a time instead of everything we have.
+    pub fn super_seeding(&self) -> bool {
+        self.shared.options.super_seeding.load(Ordering::Acquire)
+    }
+
+    /// Turn super seeding on or off, in any state.
+    pub(crate) fn set_super_seeding(&self, enabled: bool) {
+        self.shared
+            .options
+            .super_seeding
+            .store(enabled, Ordering::Release);
     }
 
     /// How the torrent orders the pieces it downloads.
@@ -573,6 +642,11 @@ impl ManagedTorrent {
                     let init = init.clone();
                     init.clear_pause_request();
                     if !init.try_start_check() {
+                        // The running check started without this stream (e.g. a paused add
+                        // or a recheck of a paused torrent): keep it for when it goes live.
+                        if let Some(peer_rx) = peer_rx {
+                            init.stash_peer_rx(peer_rx);
+                        }
                         return Ok(());
                     }
 
@@ -646,6 +720,9 @@ impl ManagedTorrent {
                                             return Err(result);
                                         }
                                     }
+                                    // Streams waiting for a piece the check found present
+                                    // won't see it downloaded: let them look again.
+                                    paused.streams.wake_all();
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     // A pause requested after the last piece was checked
@@ -653,6 +730,7 @@ impl ManagedTorrent {
                                     // live behind the caller's back. `g.paused` is the latest
                                     // intent (pause() sets it, start()/unpause clears it).
                                     let start_paused = g.paused;
+                                    let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
@@ -669,6 +747,7 @@ impl ManagedTorrent {
                                         // instead of turning a resume into an error.
                                         debug!("initial check paused, then resumed; restarting it");
                                         let start_paused = g.paused;
+                                        let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                         return _start(
                                             &t,
                                             peer_rx,
@@ -815,6 +894,7 @@ impl ManagedTorrent {
             uploaded_bytes: 0,
             finished: false,
             live: None,
+            super_seeding: self.super_seeding(),
         };
 
         {

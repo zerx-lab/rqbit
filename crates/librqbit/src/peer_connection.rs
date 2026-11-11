@@ -10,7 +10,7 @@ use crate::{
 use buffers::{ByteBuf, ByteBufOwned};
 use futures::TryFutureExt;
 use librqbit_core::{
-    hash_id::Id20,
+    hash_id::{Id20, Id32},
     lengths::{ChunkInfo, ValidPieceIndex},
     peer_id::try_decode_peer_id,
 };
@@ -132,10 +132,38 @@ pub(crate) struct PeerConnection<H> {
     handler: H,
     addr: SocketAddr,
     info_hash: Id20,
+    // BEP 52: the truncated v2 info hash of a hybrid torrent. Peers of the v2 swarm know the
+    // torrent only by it, so we accept it in incoming handshakes, and fall back to it when a
+    // peer refuses the v1 hash.
+    alt_info_hash: Option<Id20>,
+    // Whether our handshakes set the BEP 52 "supports v2" bit.
+    v2: bool,
     peer_id: Id20,
     options: PeerConnectionOptions,
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
+}
+
+// An outgoing connection once both handshakes have been exchanged.
+struct OutgoingHandshake {
+    ckind: ConnectionKind,
+    read: BoxAsyncReadVectored,
+    write: BoxAsyncWrite,
+    read_buf: ReadBuf,
+    write_buf: Box<[u8; MAX_MSG_LEN]>,
+    handshake: Handshake,
+}
+
+// Whether an outgoing connection failed the way a peer fails that does not know the info hash
+// we sent: it closes the connection during the (MSE or BitTorrent) handshake.
+fn handshake_refused(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::PeerDisconnectedReadingHandshake
+            | Error::ReadHandshake(_)
+            | Error::WriteHandshake(_)
+            | Error::MseForced(_)
+    )
 }
 
 #[cfg(not(feature = "miri"))]
@@ -290,11 +318,32 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             handler,
             addr,
             info_hash,
+            alt_info_hash: None,
+            v2: false,
             peer_id,
             spawner,
             options: options.unwrap_or_default(),
             connector,
         }
+    }
+
+    /// BitTorrent v2 (BEP 52): for a torrent with a v2 info hash, set the "supports v2" bit in
+    /// our handshakes, and when `info_hash` is the v1 hash of a hybrid torrent, also answer
+    /// to, and fall back to, the truncated v2 hash.
+    pub fn with_info_hash_v2(mut self, info_hash_v2: Option<Id32>) -> Self {
+        self.v2 = info_hash_v2.is_some();
+        self.alt_info_hash = crate::torrent_state::alt_info_hash(self.info_hash, info_hash_v2);
+        self
+    }
+
+    fn our_handshake(&self, info_hash: Id20) -> Handshake {
+        let mut h = Handshake::new(info_hash, self.peer_id);
+        h.set_supports_fast(!self.options.disable_fast_extension);
+        if self.v2 { h.with_v2_support() } else { h }
+    }
+
+    fn is_our_info_hash(&self, h: Id20) -> bool {
+        h == self.info_hash || Some(h) == self.alt_info_hash
     }
 
     // By the time this is called:
@@ -312,7 +361,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .read_write_timeout
             .unwrap_or(DEFAULT_READ_WRITE_TIMEOUT);
 
-        if incoming.handshake.info_hash != self.info_hash {
+        // Answer with the hash the peer used: for a hybrid torrent that tells whether it joined
+        // through the v1 or the v2 swarm.
+        let info_hash = incoming.handshake.info_hash;
+        if !self.is_our_info_hash(info_hash) {
             return Err(Error::WrongInfoHash);
         }
 
@@ -326,8 +378,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         );
 
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let mut my_handshake = Handshake::new(self.info_hash, self.peer_id);
-        my_handshake.set_supports_fast(!self.options.disable_fast_extension);
+        let my_handshake = self.our_handshake(info_hash);
         let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
         with_timeout(
             "writing handshake",
@@ -365,6 +416,53 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> Result<()> {
+        let first = self.connect_outgoing(self.info_hash).await;
+        let established = match (first, self.alt_info_hash) {
+            // A peer that knows a hybrid torrent only by its v2 info hash (it was added from a
+            // v2 magnet link) closes connections that carry the v1 one.
+            (Err(e), Some(alt)) if handshake_refused(&e) => {
+                debug!(
+                    addr = ?self.addr,
+                    "peer refused the v1 info hash ({e:#}), retrying with the v2 one"
+                );
+                self.connect_outgoing(alt).await?
+            }
+            (other, _) => other?,
+        };
+        let OutgoingHandshake {
+            ckind,
+            read,
+            write,
+            read_buf,
+            write_buf,
+            handshake,
+        } = established;
+
+        async move {
+            let handshake_supports_extended = handshake.supports_extended();
+            let fast = !self.options.disable_fast_extension && handshake.supports_fast();
+            self.handler
+                .on_handshake(handshake, ckind)
+                .map_err(Error::Anyhow)?;
+
+            self.manage_peer(ManagePeerArgs {
+                handshake_supports_extended,
+                fast,
+                read_buf,
+                write_buf,
+                read,
+                write,
+                outgoing_chan,
+                have_broadcast,
+            })
+            .await
+        }
+        .instrument(trace_span!("", kind=%ckind))
+        .await
+    }
+
+    // Connect to the peer and exchange handshakes carrying `info_hash`.
+    async fn connect_outgoing(&self, info_hash: Id20) -> Result<OutgoingHandshake> {
         use tokio::io::AsyncWriteExt;
         let rwtimeout = self
             .options
@@ -389,13 +487,13 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // Serialize our BT handshake once; it doubles as the MSE initial
         // payload (IA) and as the plaintext handshake.
         let mut write_buf = Box::new([0u8; MAX_MSG_LEN]);
-        let mut handshake = Handshake::new(self.info_hash, self.peer_id);
-        handshake.set_supports_fast(!self.options.disable_fast_extension);
-        let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
+        let hsz = self
+            .our_handshake(info_hash)
+            .serialize_unchecked_len(&mut *write_buf);
         let (ckind, mut read, mut write, mse_applied) = connect_with_mse_fallback(
             &self.connector,
             self.addr,
-            &self.info_hash.0,
+            &info_hash.0,
             connect_timeout,
             handshake_timeout,
             &write_buf[..hsz].try_into().map_err(|_| {
@@ -427,14 +525,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let h = read_buf
                 .read_handshake(&mut read, handshake_timeout)
                 .await?;
-            let handshake_supports_extended = h.supports_extended();
-            let fast = !self.options.disable_fast_extension && h.supports_fast();
+
             trace!(
                 peer_id=?h.peer_id,
                 decoded_id=?try_decode_peer_id(h.peer_id),
                 "connected",
             );
-            if h.info_hash != self.info_hash {
+            // BEP 52: a peer we sent the v1 hash of a hybrid torrent (with the v2 bit set) may
+            // answer with the v2 hash to upgrade the connection, as libtorrent does.
+            let upgraded =
+                self.v2 && info_hash == self.info_hash && Some(h.info_hash) == self.alt_info_hash;
+            if h.info_hash != info_hash && !upgraded {
                 return Err(Error::WrongInfoHash);
             }
 
@@ -442,19 +543,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 return Err(Error::ConnectingToOurselves);
             }
 
-            self.handler.on_handshake(h, ckind).map_err(Error::Anyhow)?;
-
-            self.manage_peer(ManagePeerArgs {
-                handshake_supports_extended,
-                fast,
-                read_buf,
-                write_buf,
+            Ok(OutgoingHandshake {
+                ckind,
                 read,
                 write,
-                outgoing_chan,
-                have_broadcast,
+                read_buf,
+                write_buf,
+                handshake: h,
             })
-            .await
         }
         .instrument(trace_span!("", kind=%ckind))
         .await
