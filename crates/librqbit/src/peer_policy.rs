@@ -340,23 +340,9 @@ impl ThrottledUpload {
     }
 
     /// Waits until `len` bytes may be uploaded. A rate lower than a block size is fine: the
-    /// wait is split in steps no bigger than one second worth of the rate.
+    /// block is let through in parts of one second worth of the rate.
     pub async fn acquire(&self, len: NonZeroU32) -> crate::Result<()> {
-        let mut left = len.get();
-        let mut stale_rate_retries = 0;
-        while let Some(left_nz) = NonZeroU32::new(left) {
-            let Some(bps) = self.0.get_upload_bps() else {
-                return Ok(());
-            };
-            let step = left_nz.min(bps);
-            match self.0.prepare_for_upload(step).await {
-                Ok(()) => left -= step.get(),
-                // The rate was lowered between reading it and waiting for it.
-                Err(_) if stale_rate_retries < 3 => stale_rate_retries += 1,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        self.0.prepare_for_upload(len).await
     }
 }
 

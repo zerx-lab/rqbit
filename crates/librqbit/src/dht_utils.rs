@@ -7,8 +7,8 @@ use librqbit_core::torrent_metainfo::TorrentMetaV1Info;
 use tracing::{Instrument, debug, debug_span};
 
 use crate::{
-    peer_connection::PeerConnectionOptions, peer_info_reader, spawn_utils::BlockingSpawner,
-    stream_connect::StreamConnector,
+    connection_limit::ConnectionLimit, peer_connection::PeerConnectionOptions, peer_info_reader,
+    spawn_utils::BlockingSpawner, stream_connect::StreamConnector,
 };
 use librqbit_core::hash_id::Id20;
 
@@ -40,6 +40,8 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
     admit: Option<AdmitFn>,
+    // The session-wide cap on peer connections: metadata connections count against it too.
+    session_slots: Arc<ConnectionLimit>,
 ) -> ReadMetainfoResult<A> {
     let mut seen = HashSet::<SocketAddr>::new();
     let mut addrs = addrs_stream;
@@ -51,11 +53,14 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
         let connector = connector.clone();
         let client_name_and_version = client_name_and_version.clone();
         let admit = admit.clone();
+        let session_slots = session_slots.clone();
         async move {
             if admit.as_ref().is_some_and(|admit| !admit(addr)) {
                 anyhow::bail!("{addr} is refused by the peer policy");
             }
+            // Ours first, then the session's, like the peer adder of a live torrent.
             let token = semaphore.acquire().await?;
+            let session_permit = session_slots.acquire().await?;
             let ret = peer_info_reader::read_metainfo_from_peer(
                 addr,
                 peer_id,
@@ -70,6 +75,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
             .await
             .with_context(|| format!("error reading metainfo from {addr}"));
+            drop(session_permit);
             drop(token);
             ret
         }
@@ -156,6 +162,7 @@ mod tests {
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),
             None,
+            ConnectionLimit::new(None),
         )
         .await
         {
