@@ -129,13 +129,13 @@ pub use type_aliases::FileInfos;
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
+/// The format of a torrent, re-exported for [`CreateTorrentOptions::version`].
+pub use librqbit_core::metainfo_v2::TorrentVersion;
 pub use librqbit_core::peer_id::*;
 /// The parsed form of [`ConnectionOptions::proxy_url`], re-exported so that a proxy URL can be
 /// checked (and shown without its password) before a session is created with it.
 pub use librqbit_core::proxy::{ProxyConfig, ProxyKind, ProxyUrlError};
 pub use librqbit_core::torrent_metainfo::*;
-/// The format of a torrent, re-exported for [`CreateTorrentOptions::version`].
-pub use librqbit_core::metainfo_v2::TorrentVersion;
 
 #[cfg(test)]
 mod tests;

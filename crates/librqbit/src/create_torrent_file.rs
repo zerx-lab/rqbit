@@ -383,7 +383,11 @@ fn v1_entries(
     let lengths = lengths.into_iter();
     let pad = pad && lengths.len() > 1;
     let mut offset = 0u64;
-    let mut out = Vec::with_capacity(if pad { 2 * lengths.len() } else { lengths.len() });
+    let mut out = Vec::with_capacity(if pad {
+        2 * lengths.len()
+    } else {
+        lengths.len()
+    });
     for (index, len) in lengths.enumerate() {
         out.push(V1Entry::File(index));
         offset = offset.checked_add(len).context("too much data")?;
@@ -486,8 +490,11 @@ impl FileTreeHasher {
 
     fn finish_piece(&mut self) -> anyhow::Result<()> {
         let piece = std::mem::take(&mut self.current);
-        self.layer
-            .push(piece.finish(self.leaves).context("piece larger than expected")?);
+        self.layer.push(
+            piece
+                .finish(self.leaves)
+                .context("piece larger than expected")?,
+        );
         self.in_piece = 0;
         Ok(())
     }
@@ -691,7 +698,10 @@ fn web_seeds(options: &CreateTorrentOptions<'_>) -> anyhow::Result<Vec<String>> 
             continue;
         }
         if out.len() == web_seed::MAX_WEB_SEEDS {
-            bail!("too many web seeds, at most {} are allowed", web_seed::MAX_WEB_SEEDS);
+            bail!(
+                "too many web seeds, at most {} are allowed",
+                web_seed::MAX_WEB_SEEDS
+            );
         }
         out.push(url.to_owned());
     }
@@ -974,13 +984,17 @@ pub(crate) mod tests {
     use super::{
         CreateTorrentCancelled, CreateTorrentOptions, CreateTorrentProgress,
         CreateTorrentProgressCallback, CreateTorrentResult, InputFile, MAX_PIECE_LENGTH,
-        MIN_PIECE_LENGTH, PROGRESS_STEP, auto_piece_length, create_torrent, sort_files,
-        v1_entries, validate_piece_length,
+        MIN_PIECE_LENGTH, PROGRESS_STEP, auto_piece_length, create_torrent, sort_files, v1_entries,
+        validate_piece_length,
     };
     use crate::spawn_utils::BlockingSpawner;
 
     const P: u32 = 16 * 1024;
     const PL: usize = P as usize;
+    /// The piece length of the layout tests.
+    pub(crate) const LAYOUT_PIECE_LENGTH: u32 = P;
+    /// The lengths of the single-file layout tests.
+    pub(crate) const SINGLE_FILE_LENGTHS: [usize; 5] = [1, 5000, PL, 2 * PL, 3 * PL + 123];
     const FORMATS: [TorrentVersion; 3] = [
         TorrentVersion::V1,
         TorrentVersion::V2,
@@ -1015,10 +1029,10 @@ pub(crate) mod tests {
     ];
 
     /// A file of a test: its path in the torrent ('/'-separated) and its content.
-    type TestFile = (String, Vec<u8>);
+    pub(crate) type TestFile = (String, Vec<u8>);
 
     /// Pseudo-random bytes, different for every `seed`, so that no two pieces are alike.
-    fn data(seed: u64, len: usize) -> Vec<u8> {
+    pub(crate) fn data(seed: u64, len: usize) -> Vec<u8> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..len)
             .map(|_| {
@@ -1037,7 +1051,7 @@ pub(crate) mod tests {
             .collect()
     }
 
-    fn write_files<'a>(root: &Path, files: impl IntoIterator<Item = &'a TestFile>) {
+    pub(crate) fn write_files<'a>(root: &Path, files: impl IntoIterator<Item = &'a TestFile>) {
         for (path, content) in files {
             let full = root.join(path);
             std::fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -1154,7 +1168,7 @@ pub(crate) mod tests {
     }
 
     /// The folders of the layout tests, with their files in torrent order.
-    fn folder_cases() -> Vec<(&'static str, Vec<TestFile>)> {
+    pub(crate) fn folder_cases() -> Vec<(&'static str, Vec<TestFile>)> {
         let many: Vec<(String, usize)> = (0..150)
             .map(|i| (format!("many/{i:03}.txt"), (i * 37) % 900 + 1))
             .collect();
@@ -1210,7 +1224,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_single_file_in_every_format() {
-        for len in [1, 5000, PL, 2 * PL, 3 * PL + 123] {
+        for len in SINGLE_FILE_LENGTHS {
             let dir = tempdir();
             let path = dir.path().join("single.bin");
             let content = data(len as u64, len);
@@ -1421,15 +1435,24 @@ pub(crate) mod tests {
 
         // One tracker: `announce` only. One web seed: a string.
         let one = torrent_bytes(dir.path(), with(&[a], &[w1])).await;
-        assert!(contains(&one, format!("8:announce{}", bencoded(a)).as_bytes()));
+        assert!(contains(
+            &one,
+            format!("8:announce{}", bencoded(a)).as_bytes()
+        ));
         assert!(!contains(&one, b"13:announce-list"));
-        assert!(contains(&one, format!("8:url-list{}", bencoded(w1)).as_bytes()));
+        assert!(contains(
+            &one,
+            format!("8:url-list{}", bencoded(w1)).as_bytes()
+        ));
 
         // Two: `announce` is the first, `announce-list` has both; the web seeds are a list.
         let two = torrent_bytes(dir.path(), with(&[a, b], &[w1, w1, w2])).await;
         let (a, b, w1, w2) = (bencoded(a), bencoded(b), bencoded(w1), bencoded(w2));
         assert!(contains(&two, format!("8:announce{a}").as_bytes()));
-        assert!(contains(&two, format!("13:announce-listll{a}{b}ee").as_bytes()));
+        assert!(contains(
+            &two,
+            format!("13:announce-listll{a}{b}ee").as_bytes()
+        ));
         assert!(contains(&two, format!("8:url-listl{w1}{w2}e").as_bytes()));
     }
 
@@ -1479,7 +1502,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_explicit_piece_lengths() {
-        for valid in [MIN_PIECE_LENGTH, 32 << 10, 1 << 20, 16 << 20, MAX_PIECE_LENGTH] {
+        for valid in [
+            MIN_PIECE_LENGTH,
+            32 << 10,
+            1 << 20,
+            16 << 20,
+            MAX_PIECE_LENGTH,
+        ] {
             assert!(validate_piece_length(valid).is_ok(), "{valid}");
         }
         for invalid in [
@@ -1635,7 +1664,10 @@ pub(crate) mod tests {
             };
             create(dir.path(), options).await.unwrap();
             let reports = reports.lock().unwrap().clone();
-            assert!(reports.iter().all(|r| r.total_bytes == total), "{reports:?}");
+            assert!(
+                reports.iter().all(|r| r.total_bytes == total),
+                "{reports:?}"
+            );
             let hashed: Vec<u64> = reports.iter().map(|r| r.hashed_bytes).collect();
             // At the start, every 8 MiB, at the end: not on every read.
             assert_eq!(hashed.len(), 4, "{hashed:?}");
