@@ -437,6 +437,7 @@ mod tests {
                     sha1: None,
                     symlink_path: None,
                     private: false,
+                    source: None,
                     meta_version: None,
                     file_tree: None,
                 },
