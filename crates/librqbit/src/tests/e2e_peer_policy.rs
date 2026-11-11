@@ -1009,31 +1009,33 @@ async fn test_choke_stops_uploads_and_keeps_the_connection() -> anyhow::Result<(
         let mut peer =
             FakePeer::connect(seed.addr(), seed.info_hash, &peer_id(b"-FK0003-")).await?;
         peer.interested().await?;
+        // The first block goes out at once: the rate starts with one second of it in the
+        // bucket. It is served before the choke is asked for, as a choke also drops a block
+        // that the writer has not sent yet.
+        peer.request(0, 0, BLOCK).await?;
+        let first = peer.expect_pieces(1, Duration::from_secs(10)).await?;
+        assert_eq!((first[0].0, first[0].1), (0, 0));
+        // The next block is 15 seconds away at this rate, so the next requests still wait for
+        // their turn when the choke comes, however long the seeder takes to read it.
+        seed.session
+            .ratelimits
+            .set_upload_bps(NonZeroU32::new(1024));
         let mut batch = Vec::new();
-        // The first goes out immediately, the next two wait for their turn, the last one chokes.
-        for (piece, begin) in [(0, 0), (0, BLOCK), (2, 0), (1, 0)] {
+        // The first two wait for their turn, the last one chokes.
+        for (piece, begin) in [(0, BLOCK), (2, 0), (1, 0)] {
             batch.extend(FakePeer::request_frame(piece, begin, BLOCK));
         }
         peer.send_raw(&batch).await?;
+        peer.expect(Wire::Choke, Duration::from_secs(10)).await?;
 
+        // With the limit lifted, whatever the choke left queued would go out at once.
+        seed.session.ratelimits.set_upload_bps(None);
         let (msgs, closed) = peer.collect(Duration::from_millis(3500)).await;
         assert!(!closed, "choked peers stay connected");
-        let pieces: Vec<_> = msgs
-            .iter()
-            .filter_map(|m| match m {
-                Wire::Piece { index, begin, .. } => Some((*index, *begin)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            pieces,
-            vec![(0, 0)],
-            "queued requests are dropped: {msgs:?}"
-        );
-        assert_eq!(
-            msgs.iter().filter(|m| **m == Wire::Choke).count(),
-            1,
-            "exactly one choke: {msgs:?}"
+        assert!(
+            msgs.iter()
+                .all(|m| !matches!(m, Wire::Piece { .. } | Wire::Choke)),
+            "queued requests are dropped, the peer is choked once: {msgs:?}"
         );
 
         // Requests after the choke are ignored, silently, but still reported.
