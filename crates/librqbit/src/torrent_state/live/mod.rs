@@ -39,6 +39,7 @@
 // > so don't lock them both at the same time at all, or at the worst lock them in the
 // > same order (peers one first, then the global one).
 
+pub(crate) mod hashes;
 pub mod peer;
 pub mod peers;
 pub mod stats;
@@ -232,6 +233,9 @@ pub struct TorrentStateLive {
 
     // Decides which interested peers we upload to.
     choker: Arc<Choker>,
+
+    // BEP 52 hash requests: the answers we give, the piece layers we fetch.
+    hashes: hashes::HashState,
 }
 
 impl TorrentStateLive {
@@ -331,6 +335,7 @@ impl TorrentStateLive {
                 paused.shared.options.upload_slots,
                 Instant::now(),
             )),
+            hashes: hashes::HashState::new(&paused.metadata.info),
         });
 
         state.spawn(
@@ -391,6 +396,13 @@ impl TorrentStateLive {
             Self::task_choker(state.choker.clone()),
         );
         crate::webseed::spawn_web_seeds(&state);
+        if state.hashes.is_fetching() {
+            state.spawn(
+                debug_span!(parent: state.shared.span.clone(), "hash_fetcher"),
+                format!("[{}]hash_fetcher", state.shared.id),
+                state.clone().task_hash_fetcher(),
+            );
+        }
         Ok(state)
     }
 
@@ -591,6 +603,7 @@ impl TorrentStateLive {
             choker,
             first_message_received: AtomicBool::new(false),
             waits_for_rate: AtomicBool::new(false),
+            hash_answers: Mutex::new(hashes::AnswerBudget::new(Instant::now())),
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
@@ -666,6 +679,7 @@ impl TorrentStateLive {
             choker,
             first_message_received: AtomicBool::new(false),
             waits_for_rate: AtomicBool::new(false),
+            hash_answers: Mutex::new(hashes::AnswerBudget::new(Instant::now())),
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
@@ -688,7 +702,9 @@ impl TorrentStateLive {
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
         )
-        .with_info_hash_v2(state.shared.info_hash_v2);
+        .with_info_hash_v2(state.shared.info_hash_v2)
+        // BEP 52: piece layers can only be asked for on v2 connections.
+        .with_v2_first(!state.metadata.info.has_all_piece_layers());
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()
@@ -843,7 +859,13 @@ impl TorrentStateLive {
         TimedExistence::new(timeit(reason, || self._locked.write()), reason)
     }
 
-    fn set_peer_live(&self, handle: PeerHandle, h: Handshake, connection_kind: ConnectionKind) {
+    fn set_peer_live(
+        &self,
+        handle: PeerHandle,
+        h: Handshake,
+        connection_kind: ConnectionKind,
+        v2: bool,
+    ) {
         let fast_extension = !self.shared.options.disable_fast_extension && h.supports_fast();
         self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             // Under the same lock as the state change, so an outgoing peer is never seen live
@@ -851,8 +873,12 @@ impl TorrentStateLive {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
             if let Some(live) = p.get_live_mut() {
                 live.fast_extension = fast_extension;
+                live.v2 = v2;
             }
         });
+        if v2 {
+            self.hashes.wake_fetcher();
+        }
     }
 
     pub fn get_uploaded_bytes(&self) -> u64 {
@@ -1390,6 +1416,9 @@ struct PeerHandler {
 
     cancel_token: CancellationToken,
 
+    // BEP 52: how many more hash requests of the peer we answer.
+    hash_answers: Mutex<hashes::AnswerBudget>,
+
     client_name_and_version: String,
 }
 
@@ -1469,6 +1498,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     self.on_pex_message(pex);
                 }
             }
+            Message::HashRequest(request) => self.on_hash_request(request)?,
+            Message::Hashes(h) => self
+                .state
+                .on_received_hashes(self.addr, &h)
+                .context("on_received_hashes")?,
+            Message::HashReject(request) => self.state.on_hash_reject(self.addr, &request),
             message => {
                 warn!(
                     id = self.state.shared.id,
@@ -1508,12 +1543,17 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(len)
     }
 
-    fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
+    fn on_handshake(
+        &self,
+        handshake: Handshake,
+        ckind: ConnectionKind,
+        v2: bool,
+    ) -> anyhow::Result<()> {
         let (peer_id, reserved) = (handshake.peer_id, handshake.reserved);
         self.policy.gate().set_fast(
             !self.state.shared.options.disable_fast_extension && handshake.supports_fast(),
         );
-        self.state.set_peer_live(self.addr, handshake, ckind);
+        self.state.set_peer_live(self.addr, handshake, ckind, v2);
         self.policy.mark_established();
         self.policy_event(PeerEvent::Handshake {
             peer_id,
@@ -1922,11 +1962,14 @@ impl PeerHandler {
                     });
                     fast.giving_back().collect()
                 };
+                // A piece whose expected hash is not known yet (BEP 52: its file's piece layer
+                // is still being fetched) could not be checked, so it is not requested.
                 let peer_has_piece = |p: ValidPieceIndex| {
                     bf.get(p.get() as usize).map(|v| *v) == Some(true)
                         && !backed_off.contains(&p)
                         && !giving_back.contains(&p)
                         && (!choked || allowed.contains(&p))
+                        && self.state.metadata.info.can_verify_piece(p)
                 };
 
                 // A suggestion is taken only when nothing more important waits: no stream
@@ -3008,6 +3051,24 @@ impl TorrentStateLive {
                 None => return Ok(()),
             };
 
+            // Pieces whose expected hash is unknown (BEP 52: the piece layer of their file was
+            // not fetched yet) are never reserved. Should one complete all the same, it cannot be
+            // trusted: it fails like a piece whose hash did not match, and is downloaded again.
+            if !state.metadata.info.can_verify_piece(chunk_info.piece_index) {
+                warn!(
+                    id = state.shared.id,
+                    info_hash = ?state.shared.info_hash,
+                    ?addr,
+                    "piece={index} cannot be verified yet: its piece layer is not known"
+                );
+                state
+                    .lock_write("mark_piece_unverifiable")
+                    .get_pieces_mut()?
+                    .mark_piece_hash_failed(chunk_info.piece_index);
+                state.new_pieces_notify.notify_waiters();
+                return Err(crate::webseed::PieceHashFailed.into());
+            }
+
             match state
                 .file_ops()
                 .check_piece(chunk_info.piece_index)
@@ -3088,6 +3149,32 @@ impl TorrentStateLive {
 }
 
 impl PeerHandler {
+    /// BEP 52: answers a hash request, or rejects it if we cannot answer it or the peer is
+    /// over its budget. Fails, disconnecting the peer, once it kept asking far past it.
+    fn on_hash_request(&self, request: peer_binary_protocol::HashRequest) -> anyhow::Result<()> {
+        let verdict = self.hash_answers.lock().take(Instant::now());
+        let reply = match verdict {
+            hashes::BudgetVerdict::Disconnect => {
+                bail!("peer keeps sending hash requests past its budget")
+            }
+            hashes::BudgetVerdict::Refuse => {
+                debug!(addr = ?self.addr, ?request, "hash request over budget, rejecting");
+                None
+            }
+            hashes::BudgetVerdict::Answer => self.state.answer_hash_request(&request),
+        };
+        let msg = match reply {
+            Some(hashes) => {
+                WriterRequest::Hashes(peer_binary_protocol::Hashes::new(request, &hashes))
+            }
+            None => WriterRequest::Message(Message::HashReject(request)),
+        };
+        self.tx
+            .send(msg)
+            .map_err(|_| Error::PeerTaskDead)
+            .context("error sending the answer to a hash request")
+    }
+
     fn send_metadata_piece(&self, piece_id: u32) -> anyhow::Result<()> {
         let data = &self.state.metadata.info_bytes;
         let metadata_size = data.len();

@@ -27,6 +27,7 @@ use tokio::{
     time::timeout,
 };
 
+mod bittorrent_v2;
 mod create_torrent;
 mod dht;
 mod fast_extension;
