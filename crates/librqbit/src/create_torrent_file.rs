@@ -243,6 +243,7 @@ pub async fn create_torrent<'a>(
             info_hash,
             info_hash_v2: None,
             piece_layers: None,
+            url_list: Vec::new(),
         },
         output_folder: res.output_folder,
     })

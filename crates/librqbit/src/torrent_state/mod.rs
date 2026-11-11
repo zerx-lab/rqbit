@@ -6,7 +6,7 @@ mod storage_ops;
 mod streaming;
 pub mod utils;
 
-pub(crate) use storage_ops::validate_renames;
+pub(crate) use storage_ops::{Quiesced, StorageLoan, validate_renames};
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
@@ -124,6 +124,9 @@ pub(crate) struct ManagedTorrentLocked {
     pub(crate) priorities: Priorities,
     // Kept here, not in the live state, so it survives pause / resume.
     pub(crate) piece_picking: PiecePicking,
+    // Set while a storage operation has the storage out of the state (see `storage_ops`), so
+    // that a stream reading meanwhile waits for it instead of reading from what's left.
+    pub(crate) storage_on_loan: bool,
 }
 
 pub(crate) struct ManagedTorrentOptions {
@@ -245,6 +248,8 @@ pub struct ManagedTorrentShared {
     // Where the files are. Session::move_storage and Session::rename_file change it at run
     // time. A leaf lock: nothing else is locked while it's held.
     pub(crate) location: RwLock<StorageLocation>,
+    /// The web seeds (BEP 19) of the torrent.
+    pub(crate) web_seeds: crate::webseed::WebSeeds,
 }
 
 /// Where the files of a torrent are stored.
@@ -253,6 +258,17 @@ pub(crate) struct StorageLocation {
     pub output_folder: PathBuf,
     // Files whose path, relative to the output folder, isn't the one the torrent gives them.
     pub renamed_files: BTreeMap<usize, PathBuf>,
+    // Set while Session::move_storage moves the files, and persisted before the first file
+    // moves, so that a move the process didn't live to finish is undone on the next start.
+    pub move_in_progress: Option<MoveInProgress>,
+}
+
+/// A [`Session::move_storage`] that may have moved some files: those at `files` (relative
+/// paths) under the persisted output folder may be under `to` instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MoveInProgress {
+    pub to: PathBuf,
+    pub files: Vec<PathBuf>,
 }
 
 impl ManagedTorrentShared {
@@ -295,6 +311,11 @@ impl ManagedTorrentShared {
     /// (relative to [`Self::output_folder`]).
     pub fn renamed_files(&self) -> BTreeMap<usize, PathBuf> {
         self.location.read().renamed_files.clone()
+    }
+
+    /// The move that persistence must remember, see [`StorageLocation::move_in_progress`].
+    pub(crate) fn move_in_progress(&self) -> Option<MoveInProgress> {
+        self.location.read().move_in_progress.clone()
     }
 }
 
@@ -587,12 +608,30 @@ impl ManagedTorrent {
                         async move {
                             let concurrent_init_semaphore =
                                 session.concurrent_initialize_semaphore.clone();
-                            let _permit = concurrent_init_semaphore
-                                .acquire()
-                                .await
-                                .context("bug: concurrent init semaphore was closed")?;
+                            // A check still waiting for its turn gives it up when asked to
+                            // pause, as a running one stops between two pieces: a pause or a
+                            // storage operation doesn't wait for other torrents' checks.
+                            let acquire = concurrent_init_semaphore.acquire();
+                            tokio::pin!(acquire);
+                            let permit = loop {
+                                let notified = t.state_change_notify.notified();
+                                tokio::pin!(notified);
+                                notified.as_mut().enable();
+                                if init.is_pause_requested() {
+                                    break None;
+                                }
+                                tokio::select! {
+                                    permit = &mut acquire => break Some(
+                                        permit.context("bug: concurrent init semaphore was closed")?,
+                                    ),
+                                    _ = notified => {}
+                                }
+                            };
 
-                            let check_result = init.check().await;
+                            let check_result = match &permit {
+                                Some(_) => init.check().await,
+                                None => Err(InitialCheckPaused.into()),
+                            };
 
                             // The check is over only once its result is in the state, under
                             // the lock: a storage operation that waits for the check to stop
@@ -628,6 +667,9 @@ impl ManagedTorrent {
                                             return Err(result);
                                         }
                                     }
+                                    // Streams waiting for a piece the check found present
+                                    // won't see it downloaded: let them look again.
+                                    paused.streams.wake_all();
                                     g.state = ManagedTorrentState::Paused(paused);
                                     t.state_change_notify.notify_waiters();
                                     // A pause requested after the last piece was checked
