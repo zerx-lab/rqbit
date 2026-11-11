@@ -19,6 +19,7 @@ mod e2e_super_seeding;
 mod e2e_trackers;
 mod e2e_v2;
 mod e2e_v2_hashes;
+mod e2e_v2_magnet;
 mod e2e_webseed;
 mod fake_peer;
 mod interop;
