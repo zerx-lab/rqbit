@@ -88,7 +88,6 @@ use crate::{
     choker::{Choker, ChokerPeer, RECHOKE_INTERVAL, Registration, SlotClass, Transferred},
     chunk_tracker::{ChunkMarkingResult, ChunkTracker, HaveNeededSelected},
     file_ops::FileOps,
-    limits::Limits,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -224,7 +223,6 @@ pub struct TorrentStateLive {
     // We have every selected piece. Changes with the selection and with completed pieces, and is
     // read for every event reported to the peer policy.
     selection_complete: Arc<AtomicBool>,
-    ratelimits: Limits,
 
     // Decides which interested peers we upload to.
     choker: Arc<Choker>,
@@ -277,7 +275,6 @@ impl TorrentStateLive {
             .peer_policy
             .is_some()
             .then(unbounded_channel::<UploadRequest>);
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -321,7 +318,6 @@ impl TorrentStateLive {
             throttled_upload_tx: throttled_upload.as_ref().map(|(tx, _)| tx.clone()),
             refused_peers: Default::default(),
             selection_complete,
-            ratelimits,
             choker: Arc::new(Choker::new(
                 paused.shared.options.upload_slots,
                 Instant::now(),
@@ -501,7 +497,7 @@ impl TorrentStateLive {
                 _ = tx.closed() => {
                     continue;
                 }
-                res = self.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
+                res = self.shared.options.ratelimits.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
                     res?;
                 }
             };
@@ -2070,6 +2066,8 @@ impl PeerHandler {
                 aframe!(self.wait_for_request_slot()).await;
 
                 self.state
+                    .shared
+                    .options
                     .ratelimits
                     .prepare_for_download(NonZeroU32::new(request.length).unwrap())
                     .await?;

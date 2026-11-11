@@ -293,6 +293,8 @@ pub struct AddTorrentOptions {
     #[serde(default)]
     pub disable_trackers: bool,
 
+    /// The torrent's own rate limits, enforced in addition to the session ones. Can be changed
+    /// later with [`Session::set_torrent_ratelimits`].
     #[serde(default)]
     pub ratelimits: LimitsConfig,
 
@@ -1537,7 +1539,7 @@ impl Session {
                     peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder,
-                    ratelimits: opts.ratelimits,
+                    ratelimits: Limits::new(opts.ratelimits),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     peer_policy: self.peer_policy.clone(),
@@ -1820,6 +1822,20 @@ impl Session {
     ) {
         handle.set_piece_picking(piece_picking);
         self.try_update_persistence_metadata(handle).await;
+    }
+
+    /// Change a torrent's own upload and download rate limits (`None`: unlimited), in any state.
+    /// A live torrent applies them at once, also to the transfers already waiting for the old
+    /// rate. They are kept across pause / resume and persisted. The session limits
+    /// ([`Session::ratelimits`]) keep applying on top of them.
+    pub async fn set_torrent_ratelimits(
+        &self,
+        handle: &ManagedTorrentHandle,
+        limits: LimitsConfig,
+    ) -> anyhow::Result<()> {
+        handle.set_ratelimits(limits);
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {

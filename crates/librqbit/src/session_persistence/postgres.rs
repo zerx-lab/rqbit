@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::{num::NonZeroU32, path::PathBuf};
 
 use crate::{
-    PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory, session::TorrentId,
-    torrent_state::ManagedTorrentHandle, type_aliases::BF,
+    PiecePicking, api::TorrentIdOrHash, bitv::BitV, bitv_factory::BitVFactory,
+    limits::LimitsConfig, session::TorrentId, torrent_state::ManagedTorrentHandle,
+    type_aliases::BF,
 };
 use anyhow::Context;
 use futures::{StreamExt, stream::BoxStream};
@@ -28,6 +29,17 @@ struct TorrentsTableRecord {
     is_paused: bool,
     sequential: bool,
     first_last_pieces_first: bool,
+    upload_bps: Option<i64>,
+    download_bps: Option<i64>,
+}
+
+// NULL is unlimited, and so is a value that does not fit (the column is wider than the rate).
+fn bps_from_column(v: Option<i64>) -> Option<NonZeroU32> {
+    NonZeroU32::new(u32::try_from(v?).ok()?)
+}
+
+fn bps_to_column(v: Option<NonZeroU32>) -> Option<i64> {
+    v.map(|v| i64::from(v.get()))
 }
 
 impl TorrentsTableRecord {
@@ -46,6 +58,10 @@ impl TorrentsTableRecord {
                 piece_picking: PiecePicking {
                     sequential: self.sequential,
                     first_last_pieces_first: self.first_last_pieces_first,
+                },
+                ratelimits: LimitsConfig {
+                    upload_bps: bps_from_column(self.upload_bps),
+                    download_bps: bps_from_column(self.download_bps),
                 },
             },
         ))
@@ -92,6 +108,8 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS first_last_pieces_first BOOLEAN NOT NULL DEFAULT FALSE"
         );
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS upload_bps BIGINT");
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS download_bps BIGINT");
 
         Ok(Self { pool })
     }
@@ -114,10 +132,11 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, upload_bps, download_bps)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
+        let ratelimits = torrent.ratelimits();
         sqlx::query(q)
             .bind::<i32>(id.try_into()?)
             .bind(&torrent.info_hash().0[..])
@@ -147,6 +166,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(torrent.is_paused())
             .bind(piece_picking.sequential)
             .bind(piece_picking.first_last_pieces_first)
+            .bind(bps_to_column(ratelimits.upload_bps))
+            .bind(bps_to_column(ratelimits.download_bps))
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -179,8 +200,9 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         torrent: &ManagedTorrentHandle,
     ) -> anyhow::Result<()> {
         let piece_picking = torrent.piece_picking();
+        let ratelimits = torrent.ratelimits();
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4 WHERE id = $5",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, upload_bps = $5, download_bps = $6 WHERE id = $7",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -190,6 +212,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(torrent.is_paused())
         .bind(piece_picking.sequential)
         .bind(piece_picking.first_last_pieces_first)
+        .bind(bps_to_column(ratelimits.upload_bps))
+        .bind(bps_to_column(ratelimits.download_bps))
         .bind::<i32>(id.try_into()?)
             .execute(&self.pool)
             .await

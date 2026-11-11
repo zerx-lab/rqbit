@@ -42,7 +42,7 @@ use crate::choker::UploadSlots;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
 use crate::file_ops::InitialCheckPaused;
-use crate::limits::LimitsConfig;
+use crate::limits::{Limits, LimitsConfig};
 use crate::piece_picker::PiecePicking;
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
@@ -130,7 +130,9 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_policy: Option<Arc<dyn crate::PeerPolicy>>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
-    pub ratelimits: LimitsConfig,
+    /// The torrent's own rate limits. They live here, not in the live state, so that a change
+    /// survives pause / resume; the session limits apply on top of them.
+    pub ratelimits: Limits,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     pub upload_slots: UploadSlots,
@@ -268,6 +270,18 @@ impl ManagedTorrent {
 
     pub fn only_files(&self) -> Option<Vec<usize>> {
         self.locked.read().only_files.clone()
+    }
+
+    /// The torrent's own upload and download rate limits (`None`: unlimited). The session
+    /// limits apply on top of them.
+    pub fn ratelimits(&self) -> LimitsConfig {
+        self.shared.options.ratelimits.get_config()
+    }
+
+    /// Change the torrent's own rate limits, in any state. A live torrent applies them at once
+    /// to both directions.
+    pub(crate) fn set_ratelimits(&self, limits: LimitsConfig) {
+        self.shared.options.ratelimits.set_config(limits);
     }
 
     /// How the torrent orders the pieces it downloads.
