@@ -16,8 +16,11 @@ use librqbit_core::magnet::Magnet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AddTorrent, AddTorrentOptions, PiecePicking, bitv_factory::BitVFactory, limits::LimitsConfig,
-    session::TorrentId, torrent_state::ManagedTorrentHandle,
+    AddTorrent, AddTorrentOptions, PiecePicking,
+    bitv_factory::BitVFactory,
+    limits::LimitsConfig,
+    session::TorrentId,
+    torrent_state::{ManagedTorrentHandle, MoveInProgress},
 };
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -52,12 +55,29 @@ pub struct SerializedTorrent {
     // Explicit piece priorities, (piece index, level).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     piece_priorities: Vec<(u32, u8)>,
+    // A Session::move_storage the process stopped in the middle of; `output_folder` is
+    // still the folder it moved from. Undone when the session loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    move_in_progress: Option<MoveInProgress>,
 }
 
 impl SerializedTorrent {
     pub fn info_hash(&self) -> &Id20 {
         &self.info_hash
     }
+
+    /// The files an interrupted move may have left at the place it moved them to, as
+    /// (path where the torrent has them, path the move gave them).
+    pub(crate) fn interrupted_move(&self) -> Option<Vec<(PathBuf, PathBuf)>> {
+        let m = self.move_in_progress.as_ref()?;
+        Some(
+            m.files
+                .iter()
+                .map(|rel| (self.output_folder.join(rel), m.to.join(rel)))
+                .collect(),
+        )
+    }
+
     pub fn into_add_torrent(self) -> anyhow::Result<(AddTorrent<'static>, AddTorrentOptions)> {
         let add_torrent = if !self.torrent_bytes.is_empty() {
             AddTorrent::TorrentFileBytes(self.torrent_bytes)
