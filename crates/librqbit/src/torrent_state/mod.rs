@@ -659,6 +659,20 @@ impl ManagedTorrent {
         }
     }
 
+    /// Resolves once the have-bitfield writes queued so far (fast-resume data) have reached
+    /// storage. Queues no write of its own.
+    pub(crate) fn wait_bitfield_flushed(&self) -> BoxFuture<'static, anyhow::Result<()>> {
+        let g = self.locked.read();
+        match &g.state {
+            ManagedTorrentState::Paused(p) => p.chunk_tracker.get_have_pieces().wait_flushed(),
+            ManagedTorrentState::Live(l) => l.wait_bitfield_flushed(),
+            // No bitfield is held in these states.
+            ManagedTorrentState::Initializing(_)
+            | ManagedTorrentState::Error(_)
+            | ManagedTorrentState::None => futures::future::ok(()).boxed(),
+        }
+    }
+
     /// Get stats.
     pub fn stats(&self) -> TorrentStats {
         use stats::TorrentStatsState as S;
