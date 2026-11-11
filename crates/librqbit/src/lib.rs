@@ -101,6 +101,7 @@ pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use choker::UploadSlots;
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use dht;
+pub use i2p::I2pOptions;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use librqbit_upnp::{
     PortMappingMethod, PortMappingOptions, PortMappingProtocol, PortMappingState, PortMappingStatus,

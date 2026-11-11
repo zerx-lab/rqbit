@@ -243,6 +243,8 @@ pub struct ManagedTorrentShared {
     pub(crate) location: RwLock<StorageLocation>,
     /// The web seeds (BEP 19) of the torrent.
     pub(crate) web_seeds: crate::webseed::WebSeeds,
+    /// Which networks (clearnet, I2P) the torrent uses.
+    pub(crate) net: crate::i2p::TorrentNet,
 }
 
 /// Where the files of a torrent are stored.

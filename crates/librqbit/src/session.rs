@@ -22,9 +22,15 @@ use crate::{
     create_torrent,
     create_torrent_file::CreateTorrentResult,
     dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    i2p::{
+        I2P_NOT_AN_I2P_TORRENT, I2pOptions, I2pRuntime, TorrentNet,
+        TrackerTransport as I2pTrackerTransport,
+    },
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
-    listen::{Accept, ListenResult, ListenerOptions},
+    listen::{
+        Accept, DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS, ListenResult, ListenerOptions,
+    },
     merge_streams::merge_streams,
     mse::{IncomingOutcome, MseMode},
     peer_connection::PeerConnectionOptions,
@@ -85,7 +91,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tracker_comms::{
-    TorrentTrackers, TrackerAnnounceOptions, TrackerCommsParams, TrackerTimings, UdpTrackerClient,
+    I2pTrackers, TorrentTrackers, TrackerAnnounceOptions, TrackerCommsParams, TrackerTimings,
+    UdpTrackerClient,
 };
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
@@ -190,6 +197,8 @@ pub struct Session {
     mse_mode: MseMode,
     peer_backoff: Option<crate::PeerBackoffConfig>,
     port_mapper: Option<SessionPortMapper>,
+    /// The I2P side of the session, when it has I2P.
+    i2p: Option<Arc<I2pRuntime>>,
 }
 
 /// The port mapper of a session and what [`Session::stop`] needs to wait for it.
@@ -629,6 +638,11 @@ pub struct SessionOptions {
     /// Do not advertise the Fast Extension (BEP 6). Default off: handshakes set the bit, and a
     /// connection uses Fast when the peer set it too.
     pub disable_fast_extension: bool,
+
+    /// Reach the I2P network through the SAM bridge of a local I2P router, for the torrents
+    /// that have I2P trackers. `None` (the default): no I2P, such trackers report an error.
+    /// See [`I2pOptions`].
+    pub i2p: Option<I2pOptions>,
 }
 
 impl Default for SessionOptions {
@@ -665,6 +679,7 @@ impl Default for SessionOptions {
             peer_backoff: None,
             peer_policy: None,
             disable_fast_extension: false,
+            i2p: None,
         }
     }
 }
@@ -924,6 +939,19 @@ impl Session {
                     .context("error building HTTP(S) client")?
             };
 
+            let (i2p, i2p_incoming) = match opts.i2p.take() {
+                Some(i2p_opts) => {
+                    let (runtime, incoming) = I2pRuntime::new(
+                        i2p_opts,
+                        token.clone(),
+                        debug_span!(parent: opts.root_span.as_ref().and_then(|s| s.id()), "i2p"),
+                        client_name_and_version.clone(),
+                    );
+                    (Some(runtime), Some(incoming))
+                }
+                None => (None, None),
+            };
+
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
@@ -931,6 +959,7 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
+                    i2p: i2p.clone(),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -1038,7 +1067,18 @@ impl Session {
                 throttled_upload: ThrottledUpload::new(),
                 lsd,
                 port_mapper,
+                i2p,
             });
+
+            if let Some(incoming) = i2p_incoming {
+                session.spawn(debug_span!(parent: session.rs(), "i2p_listen"), "i2p_listen", {
+                    let this = session.clone();
+                    async move {
+                        this.task_listener(incoming, DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS)
+                            .await
+                    }
+                });
+            }
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
@@ -1160,17 +1200,22 @@ impl Session {
             .unwrap_or_else(|| Duration::from_secs(10));
         // Separate handshake timeout for the inbound BT/MSE handshake; falls
         // back to read_write_timeout when unset (upstream behavior).
-        let handshake_timeout = self.peer_opts.handshake_timeout.unwrap_or(rwtimeout);
+        let handshake_timeout = crate::i2p::peer_handshake_timeout(
+            &addr,
+            self.peer_opts.handshake_timeout.unwrap_or(rwtimeout),
+        );
 
         let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
+        // I2P peers have synthetic addresses, which are not IPs: no IP filter applies to them.
+        let i2p_peer = kind == ConnectionKind::I2p;
+        if !i2p_peer && self.blocklist.has(incoming_ip) {
             self.stats
                 .counters
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
             bail!("Incoming ip {incoming_ip} is in blocklist");
         }
-        if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
+        if !i2p_peer && self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
             self.stats
                 .counters
                 .blocked_incoming
@@ -1187,7 +1232,8 @@ impl Session {
             bail!("Incoming ip {incoming_ip} is refused by the peer policy");
         }
 
-        if self.mse_mode == MseMode::Disabled {
+        // I2P streams are encrypted already: no MSE on them, as with libtorrent.
+        if self.mse_mode == MseMode::Disabled || i2p_peer {
             debug!(?addr, "MSE disabled, skipping MSE incoming handshake");
             let mut read_buf = ReadBuf::new();
             let mut reader = reader;
@@ -1305,6 +1351,12 @@ impl Session {
             .find(|(_, t)| t.info_hash() == h.info_hash)
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+        if !torrent.shared().net.admits(&addr) {
+            bail!(
+                "{addr} is from a network the torrent {:?} doesn't use",
+                h.info_hash
+            );
+        }
 
         let live = torrent
             .live_wait_initializing(Duration::from_secs(5))
@@ -1723,6 +1775,10 @@ impl Session {
             merge_web_seed_urls(web_seeds, opts.web_seeds.as_deref(), opts.replace_web_seeds);
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
+        let net = TorrentNet::new(
+            self.i2p.as_ref().map(|r| r.options()),
+            tiers.iter().flatten(),
+        );
 
         // A torrent that is managed already is not looked for a second time: the trackers
         // can't tell a second instance from the running one, so its announces (and above all
@@ -1740,7 +1796,7 @@ impl Session {
         }
 
         let tracker_comms =
-            self.new_torrent_trackers(info_hash, tiers, private, opts.force_tracker_interval);
+            self.new_torrent_trackers(info_hash, tiers, private, opts.force_tracker_interval, net);
         if already_managed.is_some() {
             tracker_comms.suppress_stopped();
         }
@@ -1751,6 +1807,7 @@ impl Session {
                 !opts.paused && !opts.list_only,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                net,
             )
         };
 
@@ -1933,8 +1990,9 @@ impl Session {
                 client_name_and_version: self.client_name_and_version.clone(),
                 web_seeds: WebSeeds::new(
                     web_seeds,
-                    self.disable_web_seeds || opts.disable_web_seeds,
+                    self.disable_web_seeds || opts.disable_web_seeds || !net.uses_clearnet(),
                 ),
+                net,
                 location: RwLock::new(StorageLocation {
                     output_folder,
                     renamed_files: crate::torrent_state::validate_renames(
@@ -2131,6 +2189,7 @@ impl Session {
             announce,
             t.shared().options.initial_peers.clone(),
             is_private,
+            t.shared().net,
         )
     }
 
@@ -2142,6 +2201,7 @@ impl Session {
         mut tiers: Vec<Vec<url::Url>>,
         is_private: bool,
         force_interval: Option<Duration>,
+        net: TorrentNet,
     ) -> Arc<TorrentTrackers> {
         let own_tiers = tiers.len();
         if !is_private {
@@ -2149,6 +2209,14 @@ impl Session {
             session_trackers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             tiers.extend(session_trackers.into_iter().map(|t| vec![t]));
         }
+        let i2p = match (&self.i2p, net) {
+            (Some(rt), TorrentNet::I2p { mixed }) => I2pTrackers::On {
+                transport: Arc::new(I2pTrackerTransport(rt.clone())),
+                clearnet: mixed,
+            },
+            (Some(_), TorrentNet::Clearnet) => I2pTrackers::Off(I2P_NOT_AN_I2P_TORRENT),
+            (None, _) => I2pTrackers::default(),
+        };
         TorrentTrackers::new(
             TrackerCommsParams {
                 info_hash,
@@ -2164,7 +2232,7 @@ impl Session {
                 options: self.tracker_announce,
                 timings: TrackerTimings::default(),
                 enabled: !self.disable_trackers,
-                i2p: Default::default(),
+                i2p,
             },
             tiers,
             own_tiers,
@@ -2178,9 +2246,14 @@ impl Session {
         info_hash: Id20,
         trackers: &Arc<TorrentTrackers>,
         announce: bool,
-        initial_peers: Vec<SocketAddr>,
+        mut initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        net: TorrentNet,
     ) -> Option<PeerStream> {
+        // The DHT and LSD are clearnet channels: an I2P torrent without mixed mode stays off
+        // them.
+        let is_private = is_private || !net.uses_clearnet();
+        initial_peers.retain(|a| net.admits(a));
         let dht_rx = if is_private {
             None
         } else {
@@ -2774,6 +2847,14 @@ impl Session {
 
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port
+    }
+
+    /// The `….b32.i2p` name of the I2P peer behind `addr`. I2P peers appear everywhere peers
+    /// do (peer statistics, [`PeerPolicy`], …) under synthetic addresses in `0100::/64`, the
+    /// IPv6 discard prefix; this tells which peer one stands for. `None` for any other
+    /// address, and when the session has no I2P.
+    pub fn i2p_destination(&self, addr: SocketAddr) -> Option<String> {
+        self.i2p.as_ref()?.b32_name(&addr)
     }
 
     /// Where the router port mappings of the session stand: one row per `(protocol, internal
