@@ -1739,7 +1739,9 @@ impl Session {
                         info_hash: torrent.meta.info_hash,
                         info_hash_v2: torrent.meta.info_hash_v2,
                         metadata: Some(TorrentMetadata::new(
-                            torrent.meta.validate_with_piece_layers()?,
+                            // BEP 52: the piece layers missing from the file are asked of
+                            // peers, their pieces are not downloaded until then.
+                            torrent.meta.validate_with_known_piece_layers()?,
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
@@ -3157,6 +3159,13 @@ impl Session {
         }
     }
 
+    /// Creates a torrent of the file or folder at `path` (see [`create_torrent`]) and seeds
+    /// it from there.
+    ///
+    /// The data was just hashed to create the torrent, so it is not hashed again: the
+    /// torrent is added with [`AddTorrentOptions::skip_initial_check`], which trusts files
+    /// that have their expected length (a file that changed length in between is checked).
+    /// A single file seeded under another name (`opts.name`) stays where it is.
     pub async fn create_and_serve_torrent(
         self: &Arc<Self>,
         path: &Path,
@@ -3175,6 +3184,17 @@ impl Session {
 
         let bytes = torrent.as_bytes()?;
 
+        // The file of a single-file torrent is stored under the torrent's name: point it at
+        // the file when the torrent was given another name.
+        let mut renamed_files = BTreeMap::new();
+        if path.is_file() {
+            let file_name = path.file_name().context("the file has no name")?;
+            let torrent_name = torrent.meta.info.data.name.as_ref().map(|n| n.as_ref());
+            if torrent_name != Some(file_name.as_encoded_bytes()) {
+                renamed_files.insert(0, PathBuf::from(file_name));
+            }
+        }
+
         let handle = self
             .add_torrent(
                 AddTorrent::TorrentFileBytes(bytes.clone()),
@@ -3188,6 +3208,8 @@ impl Session {
                             .context("invalid utf-8")?
                             .to_owned(),
                     ),
+                    skip_initial_check: true,
+                    renamed_files,
                     ..Default::default()
                 }),
             )
