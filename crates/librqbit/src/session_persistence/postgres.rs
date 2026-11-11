@@ -39,6 +39,8 @@ struct TorrentsTableRecord {
     // Explicit piece priorities as two parallel arrays: piece index and level.
     piece_priority_pieces: Vec<i64>,
     piece_priority_levels: Vec<i16>,
+    // A Session::move_storage the process stopped in the middle of, as JSON. NULL if none.
+    move_in_progress: Option<String>,
 }
 
 // NULL is unlimited, and so is a value that does not fit (the column is wider than the rate).
@@ -67,6 +69,16 @@ impl TorrentsTableRecord {
                 }
             },
         };
+        let move_in_progress = self.move_in_progress.as_deref().and_then(|s| {
+            serde_json::from_str(s)
+                .inspect_err(|e| {
+                    warn!(
+                        id = self.id,
+                        "ignoring broken move_in_progress {s:?}: {e:#}"
+                    )
+                })
+                .ok()
+        });
         Some((
             self.id as TorrentId,
             SerializedTorrent {
@@ -102,6 +114,7 @@ impl TorrentsTableRecord {
                     .zip(self.piece_priority_levels)
                     .filter_map(|(p, l)| Some((u32::try_from(p).ok()?, u8::try_from(l).ok()?)))
                     .collect(),
+                move_in_progress,
             },
         ))
     }
@@ -116,6 +129,15 @@ fn renamed_files_column(torrent: &ManagedTorrentHandle) -> anyhow::Result<Option
     serde_json::to_string(&renamed)
         .map(Some)
         .context("error serializing renamed_files")
+}
+
+// The move_in_progress column of a torrent: NULL when no move is underway.
+fn move_in_progress_column(torrent: &ManagedTorrentHandle) -> anyhow::Result<Option<String>> {
+    torrent
+        .shared()
+        .move_in_progress()
+        .map(|m| serde_json::to_string(&m).context("error serializing move_in_progress"))
+        .transpose()
 }
 
 impl PostgresSessionStorage {
@@ -169,6 +191,7 @@ impl PostgresSessionStorage {
         exec!(
             "ALTER TABLE torrents ADD COLUMN IF NOT EXISTS piece_priority_levels SMALLINT[] NOT NULL DEFAULT '{}'"
         );
+        exec!("ALTER TABLE torrents ADD COLUMN IF NOT EXISTS move_in_progress TEXT");
 
         Ok(Self { pool })
     }
@@ -191,8 +214,8 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .as_ref()
             .map(|i| i.torrent_bytes.clone())
             .unwrap_or_default();
-        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels)
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        let q = "INSERT INTO torrents (id, info_hash, torrent_bytes, trackers, output_folder, only_files, is_paused, sequential, first_last_pieces_first, renamed_files, upload_bps, download_bps, peer_limit, file_priorities, piece_priority_pieces, piece_priority_levels, move_in_progress)
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         ON CONFLICT(id) DO NOTHING";
         let piece_picking = torrent.piece_picking();
         let ratelimits = torrent.ratelimits();
@@ -231,6 +254,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
             .bind(file_priority_column(torrent))
             .bind(pieces)
             .bind(levels)
+            .bind(move_in_progress_column(torrent)?)
             .execute(&self.pool)
             .await
             .context("error executing INSERT INTO torrents")?;
@@ -268,7 +292,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         // The output folder changes with Session::move_storage, the file paths with
         // Session::rename_file.
         sqlx::query(
-            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12 WHERE id = $13",
+            "UPDATE torrents SET only_files = $1, is_paused = $2, sequential = $3, first_last_pieces_first = $4, output_folder = $5, renamed_files = $6, upload_bps = $7, download_bps = $8, peer_limit = $9, file_priorities = $10, piece_priority_pieces = $11, piece_priority_levels = $12, move_in_progress = $13 WHERE id = $14",
         )
         .bind(torrent.only_files().map(|v| {
             v.into_iter()
@@ -292,6 +316,7 @@ impl SessionPersistenceStore for PostgresSessionStorage {
         .bind(file_priority_column(torrent))
         .bind(pieces)
         .bind(levels)
+        .bind(move_in_progress_column(torrent)?)
         .bind::<i32>(id.try_into()?)
         .execute(&self.pool)
         .await

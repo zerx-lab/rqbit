@@ -27,6 +27,7 @@ const MAX_FASTRESUME_CHECKS: usize = 64;
 use super::{
     ManagedTorrentShared, TorrentMetadata,
     paused::{CarriedStats, TorrentStatePaused},
+    streaming::TorrentStreams,
 };
 
 pub struct TorrentStateInitializing {
@@ -43,6 +44,9 @@ pub struct TorrentStateInitializing {
     // AddTorrentOptions::skip_initial_check.
     skip_check: bool,
     carried_stats: CarriedStats,
+    // The streams of the torrent: a recheck hands them over to the state after it, so
+    // that a stream opened before keeps being woken when its pieces arrive.
+    streams: Arc<TorrentStreams>,
 }
 
 impl TorrentStateInitializing {
@@ -64,6 +68,7 @@ impl TorrentStateInitializing {
             previously_errored,
             skip_check: false,
             carried_stats: CarriedStats::default(),
+            streams: Arc::new(Default::default()),
         }
     }
 
@@ -82,6 +87,16 @@ impl TorrentStateInitializing {
 
     pub(crate) fn carried_stats(&self) -> CarriedStats {
         self.carried_stats
+    }
+
+    /// The streams the paused state after the check gets, instead of a new registry.
+    pub(crate) fn with_streams(mut self, streams: Arc<TorrentStreams>) -> Self {
+        self.streams = streams;
+        self
+    }
+
+    pub(crate) fn streams(&self) -> Arc<TorrentStreams> {
+        self.streams.clone()
     }
 
     pub(crate) fn previously_errored(&self) -> bool {
@@ -353,7 +368,7 @@ impl TorrentStateInitializing {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: Arc::new(Default::default()),
+            streams: self.streams.clone(),
             carried_stats: self.carried_stats,
         };
         Ok(paused)
