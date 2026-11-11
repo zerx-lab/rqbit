@@ -138,6 +138,8 @@ tempfile.workspace = true
 pollster.workspace = true
 # The port mapping tests use the fake routers of librqbit-upnp.
 librqbit-upnp = { workspace = true, features = ["test-util"] }
+# The proxy tests use the fake proxies of librqbit-core.
+librqbit-core = { workspace = true, features = ["test-util"] }
 
 [[example]]
 name = "simulate_traffic"
