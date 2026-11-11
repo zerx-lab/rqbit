@@ -26,8 +26,8 @@ use tokio::{
 
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, CreateTorrentOptions, ListenerOptions,
-    MseMode, PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, UploadSlots,
-    create_torrent,
+    MseMode, PeerConnectionOptions, PeerPolicy, Session, SessionOptions, SessionPersistenceConfig,
+    UploadSlots, create_torrent,
     limits::LimitsConfig,
     spawn_utils::BlockingSpawner,
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging},
@@ -413,6 +413,7 @@ pub(super) async fn start_seeder_ext(opts: SeederOpts, ext: SeederExt) -> anyhow
             upload_slots: opts.upload_slots,
             disable_fast_extension: ext.disable_fast_extension,
             mse_mode: opts.mse_mode.unwrap_or_default(),
+            peer_policy: ext.peer_policy,
             ..Default::default()
         },
     )
@@ -643,4 +644,5 @@ pub(super) struct SeederExt {
     /// Pieces of the torrent. `None`: [`PIECES`].
     pub(super) pieces: Option<u32>,
     pub(super) disable_fast_extension: bool,
+    pub(super) peer_policy: Option<Arc<dyn PeerPolicy>>,
 }
