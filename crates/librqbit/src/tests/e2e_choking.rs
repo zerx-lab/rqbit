@@ -136,6 +136,7 @@ async fn test_slots_move_to_the_peers_that_use_them() -> anyhow::Result<()> {
             upload_bps: Some(BLOCK),
             upload_slots: fixed(2),
             read_write_timeout: Some(Duration::from_secs(3)),
+            ..Default::default()
         })
         .await?;
 

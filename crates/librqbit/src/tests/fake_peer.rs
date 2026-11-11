@@ -26,7 +26,7 @@ use tokio::{
 
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, CreateTorrentOptions, ListenerOptions,
-    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, UploadSlots,
+    MseMode, PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, UploadSlots,
     create_torrent,
     limits::LimitsConfig,
     spawn_utils::BlockingSpawner,
@@ -352,6 +352,8 @@ pub(super) struct SeederOpts {
     pub(super) upload_slots: UploadSlots,
     /// How long a peer may send nothing before the seeder gives up on it. `None`: the default.
     pub(super) read_write_timeout: Option<Duration>,
+    /// The MSE mode of the seeder session. `None`: the default.
+    pub(super) mse_mode: Option<MseMode>,
 }
 
 fn loopback_listener() -> ListenerOptions {
@@ -390,6 +392,7 @@ pub(super) async fn start_seeder(opts: SeederOpts) -> anyhow::Result<Fixture> {
                 download_bps: None,
             },
             upload_slots: opts.upload_slots,
+            mse_mode: opts.mse_mode.unwrap_or_default(),
             ..Default::default()
         },
     )
