@@ -58,7 +58,7 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "GET /torrents/{id_or_infohash}/stream/{file_idx}": "Stream a file. Accepts Range header to seek.",
             "GET /torrents/{id_or_infohash}/playlist": "Playlist for supported players",
             "POST /torrents": "Add a torrent here. magnet: or http:// or a local file.",
-            "POST /torrents/create": "Create a torrent and start seeding. Body should be a local folder",
+            "POST /torrents/create": "Create a torrent and start seeding. Body should be a local file or folder. Query (all optional): output=magnet|torrent, name, trackers (repeat), version=v1|v2|hybrid, private=true, piece_length (bytes, power of two, 16 KiB..128 MiB), web_seeds (repeat), source, comment",
             "POST /torrents/resolve_magnet": "Resolve a magnet to torrent file bytes",
             "POST /torrents/{id_or_infohash}/pause": "Pause torrent",
             "POST /torrents/{id_or_infohash}/start": "Resume torrent",
@@ -75,6 +75,8 @@ async fn h_api_root(parts: Parts) -> impl IntoResponse {
             "POST /torrents/peer_limit": "Change the session-wide peer limit. POST json of the form {\"peer_limit\": 500} (null: no limit). Lowering it disconnects nobody",
             "GET /torrents/{id_or_infohash}/peer_limit": "The torrent's own peer limit, {\"peer_limit\": ...} (null: the session default)",
             "POST /torrents/{id_or_infohash}/peer_limit": "Change the torrent's own peer limit. POST json of the form {\"peer_limit\": 50} (null: the session default). Lowering it disconnects nobody",
+            "GET /torrents/{id_or_infohash}/super_seeding": "Whether super seeding (BEP 16) is on, {\"super_seeding\": true}",
+            "POST /torrents/{id_or_infohash}/super_seeding": "Turn super seeding (BEP 16) on or off. POST json of the form {\"super_seeding\": true}. Turning it on affects new connections once the torrent has every selected piece",
             "GET /torrents/{id_or_infohash}/file_priorities": "The download priority of every file, 0 (skip) to 7 (maximum): {\"file_priorities\": [1, 0, 7]}",
             "POST /torrents/{id_or_infohash}/file_priorities": "Set the priority of some files, as [file index, priority] pairs: {\"file_priorities\": [[0, 7], [2, 0]]}",
             "GET /torrents/{id_or_infohash}/web_seeds": "The web seeds (BEP 19) of the torrent: {\"web_seeds\": [{\"url\": ..., \"state\": \"Downloading\", \"downloaded_bytes\": ..., \"last_error\": null}]} (state: Idle, Downloading, BackingOff or Disabled)",
@@ -139,6 +141,10 @@ pub fn make_api_router(state: ApiState) -> Router {
         .route(
             "/torrents/{id}/peer_limit",
             get(configure::h_get_torrent_peer_limit),
+        )
+        .route(
+            "/torrents/{id}/super_seeding",
+            get(configure::h_get_torrent_super_seeding),
         );
 
     if !state.opts.read_only {
@@ -159,6 +165,10 @@ pub fn make_api_router(state: ApiState) -> Router {
             .route(
                 "/torrents/{id}/peer_limit",
                 post(configure::h_update_torrent_peer_limit),
+            )
+            .route(
+                "/torrents/{id}/super_seeding",
+                post(configure::h_update_torrent_super_seeding),
             )
             .route(
                 "/torrents/{id}/pause",

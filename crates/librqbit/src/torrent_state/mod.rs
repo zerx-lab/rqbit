@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -163,6 +163,10 @@ pub(crate) struct ManagedTorrentOptions {
     pub upload_slots: UploadSlots,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
+    /// Super seeding (BEP 16) as set by the user. It lives here, not in the live state, so that
+    /// it survives pause / resume and storage operations; the live state reads it for every new
+    /// connection.
+    pub super_seeding: AtomicBool,
 }
 
 impl ManagedTorrentOptions {
@@ -501,6 +505,22 @@ impl ManagedTorrent {
             .set_limit(Some(limit.unwrap_or(options.default_peer_limit)));
     }
 
+    /// Whether super seeding (BEP 16) is on, as set with [`crate::Session::set_super_seeding`]
+    /// or [`crate::AddTorrentOptions::super_seeding`]. It is only active while the torrent has
+    /// every selected piece, and then for the connections made from that moment on: those
+    /// see one piece at a time instead of everything we have.
+    pub fn super_seeding(&self) -> bool {
+        self.shared.options.super_seeding.load(Ordering::Acquire)
+    }
+
+    /// Turn super seeding on or off, in any state.
+    pub(crate) fn set_super_seeding(&self, enabled: bool) {
+        self.shared
+            .options
+            .super_seeding
+            .store(enabled, Ordering::Release);
+    }
+
     /// How the torrent orders the pieces it downloads.
     pub fn piece_picking(&self) -> PiecePicking {
         self.locked.read().piece_picking
@@ -620,6 +640,11 @@ impl ManagedTorrent {
                     let init = init.clone();
                     init.clear_pause_request();
                     if !init.try_start_check() {
+                        // The running check started without this stream (e.g. a paused add
+                        // or a recheck of a paused torrent): keep it for when it goes live.
+                        if let Some(peer_rx) = peer_rx {
+                            init.stash_peer_rx(peer_rx);
+                        }
                         return Ok(());
                     }
 
@@ -703,6 +728,7 @@ impl ManagedTorrent {
                                     // live behind the caller's back. `g.paused` is the latest
                                     // intent (pause() sets it, start()/unpause clears it).
                                     let start_paused = g.paused;
+                                    let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
@@ -719,6 +745,7 @@ impl ManagedTorrent {
                                         // instead of turning a resume into an error.
                                         debug!("initial check paused, then resumed; restarting it");
                                         let start_paused = g.paused;
+                                        let peer_rx = peer_rx.or_else(|| init.take_peer_rx());
                                         return _start(
                                             &t,
                                             peer_rx,
@@ -865,6 +892,7 @@ impl ManagedTorrent {
             uploaded_bytes: 0,
             finished: false,
             live: None,
+            super_seeding: self.super_seeding(),
         };
 
         {

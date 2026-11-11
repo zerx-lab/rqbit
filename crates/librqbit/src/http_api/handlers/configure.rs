@@ -102,9 +102,39 @@ pub async fn h_get_torrent_peer_limit(
     }))
 }
 
+/// The body of the super seeding endpoints. The key is required.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuperSeeding {
+    pub super_seeding: bool,
+}
+
+pub async fn h_update_torrent_super_seeding(
+    State(state): State<ApiState>,
+    Path(idx): Path<TorrentIdOrHash>,
+    Json(req): Json<SuperSeeding>,
+) -> Result<impl IntoResponse> {
+    let handle = state.api.mgr_handle(idx)?;
+    state
+        .api
+        .session()
+        .set_super_seeding(&handle, req.super_seeding)
+        .await?;
+    Ok(Json(EmptyJsonResponse {}))
+}
+
+pub async fn h_get_torrent_super_seeding(
+    State(state): State<ApiState>,
+    Path(idx): Path<TorrentIdOrHash>,
+) -> Result<impl IntoResponse> {
+    Ok(Json(SuperSeeding {
+        super_seeding: state.api.mgr_handle(idx)?.super_seeding(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PeerLimit;
+    use super::{PeerLimit, SuperSeeding};
 
     fn parse(body: &str) -> Option<Option<usize>> {
         serde_json::from_str::<PeerLimit>(body)
@@ -120,5 +150,19 @@ mod tests {
         assert_eq!(parse(r#"{"limit": 50}"#), None);
         assert_eq!(parse(r#"{"peer_limit": 5, "limit": 50}"#), None);
         assert_eq!(parse(r#"{"peer_limit": -1}"#), None);
+    }
+
+    #[test]
+    fn test_super_seeding_body() {
+        let parse = |body: &str| {
+            serde_json::from_str::<SuperSeeding>(body)
+                .ok()
+                .map(|s| s.super_seeding)
+        };
+        assert_eq!(parse(r#"{"super_seeding": true}"#), Some(true));
+        assert_eq!(parse(r#"{"super_seeding": false}"#), Some(false));
+        assert_eq!(parse(r#"{}"#), None);
+        assert_eq!(parse(r#"{"super_seeding": 1}"#), None);
+        assert_eq!(parse(r#"{"superseeding": true}"#), None);
     }
 }

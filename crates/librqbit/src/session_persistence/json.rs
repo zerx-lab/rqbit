@@ -171,8 +171,10 @@ impl JsonSessionPersistenceStore {
             file_priorities: Some(torrent.file_priorities()),
             piece_priorities: torrent.piece_priority_overrides(),
             web_seeds: Some(torrent.web_seed_urls()),
+            disable_web_seeds: torrent.web_seeds_disabled_for_torrent(),
             output_folder: torrent.output_folder(),
             renamed_files: torrent.shared().renamed_files(),
+            super_seeding: torrent.super_seeding(),
             move_in_progress: torrent.shared().move_in_progress(),
         };
 

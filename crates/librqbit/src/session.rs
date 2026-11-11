@@ -7,7 +7,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -387,6 +387,15 @@ pub struct AddTorrentOptions {
     /// piece gets from its files. Can be changed later with [`Session::set_piece_priorities`].
     #[serde(default)]
     pub piece_priorities: Option<Vec<(u32, u8)>>,
+
+    /// Super seeding (BEP 16, "initial seeding"): once the torrent has every selected piece,
+    /// the connections made from then on are not told what we have. Each peer is shown one
+    /// piece at a time, the rarest one, and the next only after the previous one has shown up
+    /// at another peer, so that every piece we upload is a new one for the swarm. While the
+    /// torrent still needs pieces it downloads normally. Can be changed later with
+    /// [`Session::set_super_seeding`].
+    #[serde(default)]
+    pub super_seeding: bool,
 
     /// Web seeds (BEP 19 HTTP(S) URLs) to download from, added to the ones the torrent or the
     /// magnet link carries (or, with `replace_web_seeds`, used instead of them). Unusable and
@@ -1978,15 +1987,13 @@ impl Session {
                     upload_slots: self.upload_slots,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
+                    super_seeding: AtomicBool::new(opts.super_seeding),
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
                 client_name_and_version: self.client_name_and_version.clone(),
-                web_seeds: WebSeeds::new(
-                    web_seeds,
-                    self.disable_web_seeds || opts.disable_web_seeds,
-                ),
+                web_seeds: WebSeeds::new(web_seeds, opts.disable_web_seeds, self.disable_web_seeds),
                 location: RwLock::new(StorageLocation {
                     output_folder,
                     renamed_files: crate::torrent_state::validate_renames(
@@ -2846,6 +2853,22 @@ impl Session {
         Ok(())
     }
 
+    /// Turn super seeding (BEP 16) on or off for a torrent, in any state (see
+    /// [`AddTorrentOptions::super_seeding`]). It is kept across pause / resume and persisted.
+    ///
+    /// Turning it on affects the connections made from then on, once the torrent has every
+    /// selected piece; the peers connected already keep what they were told. Turning it off
+    /// sends the connections in the mode a `Have` for every piece they were not shown yet.
+    pub async fn set_super_seeding(
+        &self,
+        handle: &ManagedTorrentHandle,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        handle.set_super_seeding(enabled);
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
     /// The limit on connecting + connected peers over all torrents of the session. `None`: no
     /// session-wide limit.
     pub fn global_peer_limit(&self) -> Option<usize> {
@@ -2990,6 +3013,13 @@ impl Session {
         }
     }
 
+    /// Creates a torrent of the file or folder at `path` (see [`create_torrent`]) and seeds
+    /// it from there.
+    ///
+    /// The data was just hashed to create the torrent, so it is not hashed again: the
+    /// torrent is added with [`AddTorrentOptions::skip_initial_check`], which trusts files
+    /// that have their expected length (a file that changed length in between is checked).
+    /// A single file seeded under another name (`opts.name`) stays where it is.
     pub async fn create_and_serve_torrent(
         self: &Arc<Self>,
         path: &Path,
@@ -3008,6 +3038,17 @@ impl Session {
 
         let bytes = torrent.as_bytes()?;
 
+        // The file of a single-file torrent is stored under the torrent's name: point it at
+        // the file when the torrent was given another name.
+        let mut renamed_files = BTreeMap::new();
+        if path.is_file() {
+            let file_name = path.file_name().context("the file has no name")?;
+            let torrent_name = torrent.meta.info.data.name.as_ref().map(|n| n.as_ref());
+            if torrent_name != Some(file_name.as_encoded_bytes()) {
+                renamed_files.insert(0, PathBuf::from(file_name));
+            }
+        }
+
         let handle = self
             .add_torrent(
                 AddTorrent::TorrentFileBytes(bytes.clone()),
@@ -3021,6 +3062,8 @@ impl Session {
                             .context("invalid utf-8")?
                             .to_owned(),
                     ),
+                    skip_initial_check: true,
+                    renamed_files,
                     ..Default::default()
                 }),
             )
