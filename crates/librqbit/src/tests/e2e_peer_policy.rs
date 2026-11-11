@@ -1649,9 +1649,11 @@ async fn test_refused_peer_is_not_redialed_after_a_disconnect() -> anyhow::Resul
             },
         )
         .await?;
+        // The seed hears the handshake before the client has read the seed's answer: only
+        // once the client reports it too is the connection live on both ends.
         wait_for(
             "connected",
-            || seed_policy.handshakes() == 1,
+            || seed_policy.handshakes() == 1 && policy.handshakes() == 1,
             Duration::from_secs(10),
         )
         .await?;
