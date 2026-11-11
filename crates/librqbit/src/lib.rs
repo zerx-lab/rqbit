@@ -63,6 +63,7 @@ pub mod http_api_client;
 #[cfg(any(feature = "http-api", feature = "http-api-client"))]
 pub mod http_api_types;
 mod http_client;
+mod i2p;
 mod ip_ranges;
 pub mod limits;
 mod listen;
@@ -103,6 +104,7 @@ pub use create_torrent_file::{
     CreateTorrentProgressCallback, CreateTorrentResult, auto_piece_length, create_torrent,
 };
 pub use dht;
+pub use i2p::I2pOptions;
 pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use librqbit_upnp::{
     PortMappingMethod, PortMappingOptions, PortMappingProtocol, PortMappingState, PortMappingStatus,

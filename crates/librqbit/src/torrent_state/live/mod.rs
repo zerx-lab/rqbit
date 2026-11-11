@@ -775,7 +775,15 @@ impl TorrentStateLive {
                 .upgrade()
                 .ok_or(Error::SessionDestroyed)?;
 
-            if session.ipv4_only && addr.is_ipv6() {
+            // A peer of a network the torrent doesn't use is never dialed. I2P peers have
+            // synthetic addresses, which are not IPs: no IP filter applies to them.
+            if !state.shared.net.admits(&addr) {
+                debug!(?addr, "skipping peer of a network the torrent doesn't use");
+                continue;
+            }
+            let i2p_peer = librqbit_core::i2p::is_synthetic(&addr);
+
+            if session.ipv4_only && addr.is_ipv6() && !i2p_peer {
                 debug!(?addr, "skipping ipv6 peer (ipv4_only=true)");
                 continue;
             }
@@ -785,7 +793,7 @@ impl TorrentStateLive {
                 continue;
             }
 
-            if session.blocklist.has(addr.ip()) {
+            if !i2p_peer && session.blocklist.has(addr.ip()) {
                 session
                     .stats
                     .counters
@@ -795,10 +803,11 @@ impl TorrentStateLive {
                 continue;
             }
 
-            if session
-                .allowlist
-                .as_ref()
-                .is_some_and(|l| !l.has(addr.ip()))
+            if !i2p_peer
+                && session
+                    .allowlist
+                    .as_ref()
+                    .is_some_and(|l| !l.has(addr.ip()))
             {
                 session
                     .stats
@@ -1296,9 +1305,11 @@ impl TorrentStateLive {
                 connected.clear();
                 dropped.clear();
 
+                // I2P peers are never told to anyone: their synthetic addresses aren't real.
                 connected.extend(
                     live_peers
                         .difference(&peer_view_of_live_peers)
+                        .filter(|a| !librqbit_core::i2p::is_synthetic(a))
                         .take(MAX_SENT_PEERS)
                         .copied(),
                 );
@@ -1672,7 +1683,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        // No PEX inside I2P, nor anywhere for a torrent that stays inside I2P.
+        if !self.state.metadata.info.info().private
+            && hs.m.ut_pex.is_some()
+            && self.state.shared.net.pex_with(&self.addr)
+        {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -1689,17 +1704,22 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     .task_send_pex_to_peer(self.addr, self.tx.clone()),
             );
         }
-        // Lets update outgoing Socket address for incoming connection
+        // Lets update outgoing Socket address for incoming connection. Not for an I2P peer:
+        // it is reached by its destination, whatever port it names; and a clearnet peer
+        // naming a synthetic address must not make us dial into I2P.
         if self.incoming
+            && !librqbit_core::i2p::is_synthetic(&self.addr)
             && let Some(port) = hs.port()
         {
             let peer_ip = hs.ip_addr().unwrap_or(self.addr.ip());
             let outgoing_addr = SocketAddr::new(peer_ip, port);
-            self.state
-                .peers
-                .with_peer_mut(self.addr, "update outgoing addr", |peer| {
-                    peer.outgoing_address = Some(outgoing_addr)
-                });
+            if !librqbit_core::i2p::is_synthetic(&outgoing_addr) {
+                self.state
+                    .peers
+                    .with_peer_mut(self.addr, "update outgoing addr", |peer| {
+                        peer.outgoing_address = Some(outgoing_addr)
+                    });
+            }
         }
 
         Ok(())
@@ -1737,6 +1757,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
         // How many requests we queue for a peer, see MAX_QUEUED_UPLOADS_PER_PEER.
         handshake.reqq = Some(MAX_QUEUED_UPLOADS_PER_PEER);
+        // No PEX with a peer we never exchange peers with (an I2P peer, or any peer of an
+        // I2P-only torrent): it must not wait for messages that never come.
+        if !self.state.shared.net.pex_with(&self.addr) {
+            handshake.m.ut_pex = None;
+        }
 
         Ok(())
     }
@@ -3289,8 +3314,14 @@ impl PeerHandler {
     }
 
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
+        // PEX from an I2P peer, or for a torrent that stays inside I2P, is ignored; and a PEX
+        // message never brings I2P peers.
+        if !self.state.shared.net.pex_with(&self.addr) {
+            return;
+        }
         msg.dropped_peers()
             .chain(msg.added_peers())
+            .filter(|peer| !librqbit_core::i2p::is_synthetic(&peer.addr))
             .for_each(|peer| {
                 self.state
                     .add_peer_if_not_seen(peer.addr)

@@ -5,6 +5,7 @@ mod e2e_connection_limits;
 mod e2e_fast;
 mod e2e_fastresume_flush;
 mod e2e_have;
+mod e2e_i2p;
 mod e2e_init_pause;
 mod e2e_padded_files;
 mod e2e_peer_policy;
