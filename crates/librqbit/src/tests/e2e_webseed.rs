@@ -974,8 +974,70 @@ async fn check_restart(
     session.unpause(&handle).await?;
     wait_completed(&handle).await?;
     torrent.check_files(&out)?;
+    // Leaves the store as it found it (the postgres database is shared by the checks).
+    session
+        .delete(TorrentIdOrHash::Hash(info_hash), false)
+        .await?;
     session.stop().await;
     Ok(())
+}
+
+/// A torrent added with its web seeds disabled keeps them disabled after a restart through
+/// `persistence`: the server is never asked.
+async fn check_disabled_restart(
+    persistence: impl Fn(&Path) -> Option<SessionPersistenceConfig>,
+) -> anyhow::Result<()> {
+    let (server, torrent) = serve(|l| single_file("off.bin", 8 * PIECE, l), &[]).await?;
+    let dir = TempDir::with_prefix("rqbit_webseed_off")?;
+    let out = dir.path().join("out");
+    let opts = || SessionOptions {
+        persistence: persistence(dir.path()),
+        ..client_opts()
+    };
+    let session = Session::new_with_opts(dir.path().into(), opts()).await?;
+    let handle = add(
+        &session,
+        &torrent,
+        &out,
+        AddTorrentOptions {
+            disable_web_seeds: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let info_hash = handle.info_hash();
+    assert_eq!(only_seed(&handle)?.state, WebSeedState::Disabled);
+    session.stop().await;
+    drop(handle);
+    drop(session);
+
+    let session = Session::new_with_opts(dir.path().into(), opts()).await?;
+    let handle = session
+        .get(TorrentIdOrHash::Hash(info_hash))
+        .context("torrent was not restored")?;
+    handle.wait_until_initialized().await?;
+    let seed = only_seed(&handle)?;
+    assert_eq!(seed.url, server.url());
+    assert_eq!(seed.state, WebSeedState::Disabled);
+    // A live torrent with an enabled web seed would have asked it by now: the first request
+    // goes out as soon as the torrent is live.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(server.log().is_empty(), "{:?}", server.log());
+    session
+        .delete(TorrentIdOrHash::Hash(info_hash), false)
+        .await?;
+    session.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disabled_web_seeds_survive_a_session_restart() -> anyhow::Result<()> {
+    run(check_disabled_restart(|dir| {
+        Some(SessionPersistenceConfig::Json {
+            folder: Some(dir.join("session")),
+        })
+    }))
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -988,19 +1050,24 @@ async fn test_web_seeds_survive_a_session_restart() -> anyhow::Result<()> {
     .await
 }
 
-/// The same through the Postgres store. Needs an empty database:
-/// `RQBIT_TEST_POSTGRES_URL=postgresql://... cargo test -p librqbit --features postgres -- --ignored postgres`
+/// The same through the Postgres store, one check after the other. Needs a database of its
+/// own: `RQBIT_TEST_POSTGRES_URL=postgresql://... cargo test -p librqbit --features postgres
+/// -- --ignored postgres`
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs RQBIT_TEST_POSTGRES_URL"]
 async fn test_web_seeds_survive_a_session_restart_postgres() -> anyhow::Result<()> {
     let url = std::env::var("RQBIT_TEST_POSTGRES_URL")
-        .context("RQBIT_TEST_POSTGRES_URL must point at an empty database")?;
-    run(check_restart(move |_| {
+        .context("RQBIT_TEST_POSTGRES_URL must point at a database of its own")?;
+    let persistence = move |_: &Path| {
         Some(SessionPersistenceConfig::Postgres {
             connection_string: url.clone(),
         })
-    }))
+    };
+    run(async {
+        check_restart(&persistence).await?;
+        check_disabled_restart(&persistence).await
+    })
     .await
 }
 

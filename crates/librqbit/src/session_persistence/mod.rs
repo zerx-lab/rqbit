@@ -59,6 +59,9 @@ pub struct SerializedTorrent {
     // removed. Missing in older state: the torrent's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_seeds: Option<Vec<String>>,
+    // Web seeds are disabled for this torrent (AddTorrentOptions::disable_web_seeds).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    disable_web_seeds: bool,
     // A Session::move_storage the process stopped in the middle of; `output_folder` is
     // still the folder it moved from. Undone when the session loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +115,7 @@ impl SerializedTorrent {
             piece_priorities: (!self.piece_priorities.is_empty()).then_some(self.piece_priorities),
             replace_web_seeds: self.web_seeds.is_some(),
             web_seeds: self.web_seeds,
+            disable_web_seeds: self.disable_web_seeds,
             overwrite: true,
             ..Default::default()
         };
