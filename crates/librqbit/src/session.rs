@@ -82,7 +82,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{
+    TorrentTrackers, TrackerAnnounceOptions, TrackerCommsParams, TrackerTimings, UdpTrackerClient,
+};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
@@ -136,6 +138,7 @@ pub struct Session {
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
+    tracker_announce: TrackerAnnounceOptions,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -530,6 +533,10 @@ pub struct SessionOptions {
     // The list of tracker URLs to always use for each torrent.
     pub trackers: HashSet<url::Url>,
 
+    /// How announces are spread over the tiers and the trackers of a tier. The default
+    /// announces to every tracker; see [`TrackerAnnounceOptions`].
+    pub tracker_announce: TrackerAnnounceOptions,
+
     /// Default peer limit per torrent ([`DEFAULT_PEER_LIMIT`] if not set): how many peers each
     /// torrent may have connecting or connected at a time. A torrent can override it, see
     /// [`AddTorrentOptions::peer_limit`].
@@ -589,6 +596,7 @@ impl Default for SessionOptions {
             blocklist_url: None,
             allowlist_url: None,
             trackers: HashSet::new(),
+            tracker_announce: TrackerAnnounceOptions::default(),
             peer_limit: None,
             global_peer_limit: None,
             upload_slots: UploadSlots::default(),
@@ -604,20 +612,28 @@ impl Default for SessionOptions {
     }
 }
 
-fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
+fn torrent_file_from_info_bytes(
+    info_bytes: &[u8],
+    tiers: &[Vec<url::Url>],
+) -> anyhow::Result<Bytes> {
     #[derive(Serialize)]
     struct Tmp<'a> {
         announce: &'a str,
         #[serde(rename = "announce-list")]
-        announce_list: &'a [&'a [url::Url]],
+        announce_list: &'a [Vec<url::Url>],
         info: bencode::raw_value::RawValue<&'a [u8]>,
     }
 
     let mut w = Vec::new();
     let v = Tmp {
         info: bencode::raw_value::RawValue(info_bytes),
-        announce: trackers.first().map(|s| s.as_str()).unwrap_or(""),
-        announce_list: &[trackers],
+        announce: tiers
+            .iter()
+            .flatten()
+            .next()
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+        announce_list: tiers,
     };
     bencode_serialize_to_writer(&v, &mut w)?;
     Ok(w.into())
@@ -635,7 +651,7 @@ pub(crate) struct CheckedIncomingConnection {
 struct InternalAddResult {
     info_hash: Id20,
     metadata: Option<TorrentMetadata>,
-    trackers: Vec<url::Url>,
+    tiers: Vec<Vec<url::Url>>,
     name: Option<String>,
 }
 
@@ -919,6 +935,7 @@ impl Session {
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
+                tracker_announce: opts.tracker_announce,
                 peer_limit: opts.peer_limit,
                 upload_slots: opts.upload_slots,
                 client_name_and_version,
@@ -1345,6 +1362,7 @@ impl Session {
             .cloned()
             .collect::<Vec<_>>();
         for torrent in torrents {
+            torrent.shared().tracker_comms.stop();
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
             }
@@ -1403,10 +1421,12 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
-                        trackers: magnet
+                        tiers: magnet
                             .trackers
                             .into_iter()
+                            .chain(opts.trackers.clone().unwrap_or_default())
                             .filter_map(|t| url::Url::parse(&t).ok())
+                            .map(|t| vec![t])
                             .collect(),
                         metadata: None,
                         name: magnet.name,
@@ -1430,20 +1450,30 @@ impl Session {
                         }
                     };
 
-                    let mut trackers = torrent
+                    let mut tiers = torrent
                         .meta
-                        .iter_announce()
-                        .unique()
-                        .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
-                            Ok(url) => Some(url.to_owned()),
-                            Err(_) => {
-                                warn!("cannot parse tracker url as utf-8, ignoring");
-                                None
-                            }
+                        .announce_tiers()
+                        .into_iter()
+                        .map(|tier| {
+                            tier.into_iter()
+                                .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
+                                    Ok(url) => url::Url::parse(url).ok(),
+                                    Err(_) => {
+                                        warn!("cannot parse tracker url as utf-8, ignoring");
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
                         })
                         .collect::<Vec<_>>();
+                    // The trackers the caller adds are tiers of their own, after the torrent's.
                     if let Some(custom_trackers) = opts.trackers.clone() {
-                        trackers.extend(custom_trackers);
+                        tiers.extend(
+                            custom_trackers
+                                .iter()
+                                .filter_map(|t| url::Url::parse(t).ok())
+                                .map(|t| vec![t]),
+                        );
                     }
 
                     InternalAddResult {
@@ -1453,10 +1483,7 @@ impl Session {
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
-                        trackers: trackers
-                            .iter()
-                            .filter_map(|t| url::Url::parse(t).ok())
-                            .collect(),
+                        tiers,
                         name: None,
                     }
                 }
@@ -1519,18 +1546,19 @@ impl Session {
         let InternalAddResult {
             info_hash,
             metadata,
-            trackers,
+            tiers,
             name,
         } = add_res;
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
 
+        let tracker_comms =
+            self.new_torrent_trackers(info_hash, tiers, private, opts.force_tracker_interval);
         let make_peer_rx = || {
             self.make_peer_rx(
                 info_hash,
-                trackers.clone(),
+                &tracker_comms,
                 !opts.paused && !opts.list_only,
-                opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
             )
@@ -1554,7 +1582,12 @@ impl Session {
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
                     magnet_peer_opts.mse_mode = self.mse_mode;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, Some(magnet_peer_opts))
+                        .resolve_magnet(
+                            info_hash,
+                            peer_rx,
+                            &tracker_comms.own_tiers(),
+                            Some(magnet_peer_opts),
+                        )
                         .await?;
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
@@ -1656,12 +1689,12 @@ impl Session {
                 id,
                 span,
                 info_hash,
-                trackers: trackers.into_iter().collect(),
+                trackers: tracker_comms.own_tiers().into_iter().flatten().collect(),
+                tracker_comms: tracker_comms.clone(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
                 storage_factory,
                 options: ManagedTorrentOptions {
-                    force_tracker_interval: opts.force_tracker_interval,
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_handshake_timeout: peer_opts.handshake_timeout,
@@ -1764,6 +1797,11 @@ impl Session {
                 })
                 .context("no such torrent in db")?,
         };
+        // Tell the trackers while the numbers are still the torrent's own.
+        let to_stop = self.db.read().torrents.get(&id).cloned();
+        if let Some(t) = to_stop {
+            t.shared().tracker_comms.stop();
+        }
         let removed = self
             .db
             .write()
@@ -1843,11 +1881,47 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
-            t.shared().trackers.iter().cloned().collect(),
+            &t.shared().tracker_comms,
             announce,
-            t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+        )
+    }
+
+    /// Builds what talks to the trackers of one torrent: the torrent's own tiers, then every
+    /// tracker of the session as a tier of its own (never for private torrents).
+    fn new_torrent_trackers(
+        self: &Arc<Self>,
+        info_hash: Id20,
+        mut tiers: Vec<Vec<url::Url>>,
+        is_private: bool,
+        force_interval: Option<Duration>,
+    ) -> Arc<TorrentTrackers> {
+        let own_tiers = tiers.len();
+        if !is_private {
+            let mut session_trackers: Vec<_> = self.trackers.iter().cloned().collect();
+            session_trackers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            tiers.extend(session_trackers.into_iter().map(|t| vec![t]));
+        }
+        TorrentTrackers::new(
+            TrackerCommsParams {
+                info_hash,
+                peer_id: self.peer_id,
+                stats: Box::new(PeerRxTorrentInfo {
+                    info_hash,
+                    session: Arc::downgrade(self),
+                }),
+                force_interval,
+                announce_port: self.announce_port().unwrap_or(4240),
+                reqwest_client: self.reqwest_client.clone(),
+                udp_client: self.udp_tracker_client.clone(),
+                options: self.tracker_announce,
+                timings: TrackerTimings::default(),
+                enabled: !self.disable_trackers,
+            },
+            tiers,
+            own_tiers,
+            true,
         )
     }
 
@@ -1855,9 +1929,8 @@ impl Session {
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
-        mut trackers: Vec<url::Url>,
+        trackers: &Arc<TorrentTrackers>,
         announce: bool,
-        force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
@@ -1877,34 +1950,7 @@ impl Session {
             })
         };
 
-        if self.disable_trackers {
-            trackers.clear();
-        }
-
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
-        } else if !self.disable_trackers {
-            trackers.extend(self.trackers.iter().cloned());
-        }
-
-        let tracker_rx_stats = PeerRxTorrentInfo {
-            info_hash,
-            session: self.clone(),
-        };
-        let tracker_rx = TrackerComms::start(
-            info_hash,
-            self.peer_id,
-            trackers.into_iter().collect(),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
-            self.reqwest_client.clone(),
-            self.udp_tracker_client.clone(),
-        );
+        let tracker_rx = trackers.peer_stream();
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1929,6 +1975,7 @@ impl Session {
     }
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        handle.shared().tracker_comms.stop();
         handle.pause()?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
@@ -1939,6 +1986,22 @@ impl Session {
         handle.start(peer_rx, false)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
+    }
+
+    /// Announces to the trackers of the torrent that are in use right now, without waiting for
+    /// the interval. A tracker is never asked more often than once every 10 seconds, however
+    /// often this is called. Fails when the torrent is not running (paused or still checking
+    /// its files), as it is not announcing then.
+    pub fn reannounce(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        handle.shared().tracker_comms.reannounce()
+    }
+
+    /// Asks the trackers of the torrent that are in use right now how many seeders and
+    /// leechers they know of (BEP 48 / BEP 15 scrape). The answers show up in
+    /// [`ManagedTorrent::trackers`] shortly after. A tracker is never asked more often than
+    /// once every 10 seconds. Fails when the torrent is not running.
+    pub fn scrape(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        handle.shared().tracker_comms.scrape()
     }
 
     pub async fn update_only_files(
@@ -2115,7 +2178,7 @@ impl Session {
         self: &Arc<Self>,
         info_hash: Id20,
         peer_rx: PeerStream,
-        trackers: &[url::Url],
+        tiers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
@@ -2141,7 +2204,7 @@ impl Session {
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
                         info,
-                        torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
+                        torrent_file_from_info_bytes(info_bytes.as_ref(), tiers)?,
                         info_bytes.0,
                     )?,
                     peer_rx: rx,
@@ -2245,12 +2308,15 @@ fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {
 // Ad adapter for converting stats into the format that tracker_comms accepts.
 struct PeerRxTorrentInfo {
     info_hash: Id20,
-    session: Arc<Session>,
+    session: std::sync::Weak<Session>,
 }
 
 impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
     fn get(&self) -> tracker_comms::TrackerCommsStats {
-        let mt = self.session.with_torrents(|torrents| {
+        let Some(session) = self.session.upgrade() else {
+            return Default::default();
+        };
+        let mt = session.with_torrents(|torrents| {
             for (_, mt) in torrents {
                 if mt.info_hash() == self.info_hash {
                     return Some(mt.clone());
@@ -2323,8 +2389,11 @@ mod tests {
         let parsed = torrent_from_bytes(&orig_full_torrent[..]).unwrap();
         let parsed_trackers = get_trackers(&parsed);
 
-        let generated_torrent =
-            torrent_file_from_info_bytes(parsed.info.raw_bytes.as_ref(), &parsed_trackers).unwrap();
+        let generated_torrent = torrent_file_from_info_bytes(
+            parsed.info.raw_bytes.as_ref(),
+            std::slice::from_ref(&parsed_trackers),
+        )
+        .unwrap();
         let generated_parsed = torrent_from_bytes(generated_torrent.as_ref()).unwrap();
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
