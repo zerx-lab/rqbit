@@ -24,6 +24,7 @@ mod e2e_v2_magnet;
 mod e2e_webseed;
 mod fake_peer;
 mod interop;
+mod session_teardown;
 pub mod test_util;
 pub(crate) mod v2_torrent;
 mod web_seed_server;

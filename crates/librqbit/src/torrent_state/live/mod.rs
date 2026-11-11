@@ -837,6 +837,10 @@ impl TorrentStateLive {
                 continue;
             }
 
+            // The session must not be kept alive while waiting for a peer permit below,
+            // or a dropped session would never be cancelled.
+            drop(session);
+
             // Held by the connection task for as long as it lives; see PeerPermits::acquire for
             // why the torrent's permit comes first.
             let options = &state.shared.options;
