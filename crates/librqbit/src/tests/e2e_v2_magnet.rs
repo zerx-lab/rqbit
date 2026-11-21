@@ -231,3 +231,53 @@ async fn test_v2_magnet_forged_info_dict_is_rejected() -> anyhow::Result<()> {
     })
     .await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn private_magnet_drops_manual_peers_after_metadata() -> anyhow::Result<()> {
+    run(async {
+        use crate::tests::v2_torrent::{B, V2Files};
+        let files = V2Files::random(&[("payload.bin", 1024)], 42);
+        let mut torrent = files.torrent("private", PIECE_LEN, false);
+        torrent.map().get_mut(b"info".as_slice()).context("info")?.set("private", B::I(1));
+        let bytes = Bytes::from(torrent.to_bytes());
+        let parsed = torrent_from_bytes(&bytes)?;
+        let hash = parsed.info_hash_v2.context("v2 hash")?;
+        let info = parsed.info.raw_bytes.as_ref();
+        let metadata = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let late = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let dir = TempDir::new()?;
+        let client = new_session(dir.path(), SessionSetup { plaintext: true, ..Default::default() }).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(metadata.local_addr()?).await?;
+        let adding = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client.add_torrent(
+                    AddTorrent::from_url(format!("magnet:?xt=urn:btmh:1220{}", hash.as_string())),
+                    Some(AddTorrentOptions { disable_trackers: true, magnet_peers: Some(rx), ..Default::default() }),
+                ).await
+            }
+        });
+        let (mut peer, _) = FakePeer::accept(&metadata, &peer_id(b"-PR0001-"), V2_RESERVED).await?;
+        peer.extended_handshake(format!("d1:md11:ut_metadatai{OUR_UT_METADATA}ee13:metadata_sizei{}ee", info.len()).as_bytes()).await?;
+        let mut data = vec![OUR_UT_METADATA];
+        data.extend_from_slice(format!("d8:msg_typei1e5:piecei0e10:total_sizei{}ee", info.len()).as_bytes());
+        data.extend_from_slice(info);
+        peer.send(20, &data).await?;
+        let handle = tokio::time::timeout(Duration::from_secs(10), adding).await???.into_handle().context("private handle")?;
+        assert!(handle.with_metadata(|metadata| metadata.info.info().private)?);
+        let late_addr = late.local_addr()?;
+        if !tx.is_closed() {
+            // Race the hand-off: either the stream is already closed or it must discard this address.
+            assert!(matches!(tx.try_send(late_addr), Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_))));
+        }
+        tokio::time::timeout(Duration::from_secs(10), tx.closed()).await?;
+        tokio::select! {
+            result = metadata.accept() => anyhow::bail!("metadata peer dialed again: {}", result?.1),
+            result = late.accept() => anyhow::bail!("late manual peer dialed: {}", result?.1),
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        client.stop().await;
+        Ok(())
+    }).await
+}
