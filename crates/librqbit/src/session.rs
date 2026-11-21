@@ -105,6 +105,10 @@ pub const DEFAULT_PEER_LIMIT: usize = 128;
 
 pub type TorrentId = usize;
 
+fn usable_manual_peer(addr: &SocketAddr) -> bool {
+    addr.port() != 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast()
+}
+
 // How long an incoming connection that has a torrent permit may queue for a session permit
 // before it is refused. Short: the peer waits for our handshake meanwhile.
 const INCOMING_SESSION_SLOT_WAIT: Duration = Duration::from_secs(3);
@@ -347,6 +351,11 @@ pub struct AddTorrentOptions {
 
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
+
+    /// Additional user-selected peers for pending magnet metadata resolution.
+    /// These use the same connector, policy and connection limits as discovered peers.
+    #[serde(skip)]
+    pub magnet_peers: Option<tokio::sync::mpsc::Receiver<SocketAddr>>,
 
     /// Max concurrent connecting + connected peers of this torrent. `None`: the session's
     /// default ([`SessionOptions::peer_limit`]). Can be changed later with
@@ -1929,12 +1938,41 @@ impl Session {
                     (metadata, info_hash_v2, peer_rx)
                 }
                 None => {
-                    let peer_rx = make_peer_rx().context(
-                        "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
+                    let discovered = make_peer_rx();
+                    let stop_manual = CancellationToken::new();
+                    let manual_seen = opts
+                        .magnet_peers
+                        .as_ref()
+                        .map(|_| Arc::new(Mutex::new(HashSet::new())));
+                    let manual =
+                        opts.magnet_peers
+                            .take()
+                            .zip(manual_seen.clone())
+                            .map(|(rx, seen)| {
+                                let session = Arc::downgrade(self);
+                                tokio_stream::wrappers::ReceiverStream::new(rx)
+                                    .filter(move |addr| {
+                                        futures::future::ready(
+                                            usable_manual_peer(addr)
+                                                && net.admits(addr)
+                                                && session.upgrade().is_some_and(|session| {
+                                                    !net.uses_clearnet()
+                                                        || !session.blocklist.has(addr.ip())
+                                                }),
+                                        )
+                                    })
+                                    .inspect(move |addr| {
+                                        seen.lock().insert(*addr);
+                                    })
+                                    .take_until(stop_manual.clone().cancelled_owned())
+                                    .boxed()
+                            });
+                    let peer_rx = merge_two_optional_streams(discovered, manual).context(
+                        "no known way to resolve peers (no DHT, no trackers, no initial or manual peers)",
                     )?;
                     let mut magnet_peer_opts = opts.peer_opts.unwrap_or_default();
                     magnet_peer_opts.mse_mode = self.mse_mode;
-                    let resolved_magnet = self
+                    let mut resolved_magnet = self
                         .resolve_magnet(
                             info_hash,
                             info_hash_v2,
@@ -1947,10 +1985,19 @@ impl Session {
                     // is private (BEP 27): they go now.
                     if resolved_magnet.metadata.info.info().private {
                         tracker_comms.drop_session_tiers();
+                        stop_manual.cancel();
                     }
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
                     // while resolving the magnet.
+                    if resolved_magnet.metadata.info.info().private
+                        && let Some(manual_seen) = manual_seen
+                    {
+                        let manual_seen = manual_seen.lock();
+                        resolved_magnet
+                            .seen_peers
+                            .retain(|addr| !manual_seen.contains(addr));
+                    }
                     seen_peers = resolved_magnet.seen_peers.clone();
                     let mut peer_rx = merge_streams(
                         resolved_magnet.peer_rx,
@@ -2939,6 +2986,23 @@ impl Session {
             trackers.reannounce()?;
         }
         Ok(())
+    }
+
+    /// Queue a user-selected peer for a running public torrent. Returns `false`
+    /// if it is already known; the normal connection scheduler decides whether to dial it.
+    pub fn add_manual_peer(
+        &self,
+        handle: &ManagedTorrentHandle,
+        addr: SocketAddr,
+    ) -> anyhow::Result<bool> {
+        let live = handle.live().context("torrent is not running")?;
+        anyhow::ensure!(!live.info().info().private, "private torrent");
+        anyhow::ensure!(
+            handle.shared().net.admits(&addr),
+            "address is outside the torrent network"
+        );
+        anyhow::ensure!(usable_manual_peer(&addr), "not a usable peer address");
+        Ok(live.add_peer_if_not_seen(addr)?)
     }
 
     /// Asks the trackers of the torrent that are in use right now how many seeders and

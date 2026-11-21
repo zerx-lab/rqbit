@@ -131,6 +131,82 @@ fn have(handle: &ManagedTorrentHandle, piece: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_peer_is_sufficient_for_magnet_and_live_torrent() -> anyhow::Result<()> {
+    run(async {
+        let files = sample_files(99);
+        let torrent = Bytes::from(files.torrent("v2", PIECE_LEN, false).to_bytes());
+        let hash = torrent_from_bytes(&torrent)?
+            .info_hash_v2
+            .context("v2 hash")?;
+        let seed_dir = TempDir::with_prefix("rqbit_manual_seed")?;
+        files.write_to(seed_dir.path());
+        let seeder = new_session(
+            seed_dir.path(),
+            SessionSetup {
+                listen: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let seed = add(&seeder, torrent.clone(), seed_dir.path(), vec![]).await?;
+        completed(&seed, Duration::from_secs(20)).await?;
+        let addr = seeder.listen_addr().context("seed address")?;
+        let result = async {
+            let dir = TempDir::with_prefix("rqbit_manual_client")?;
+            for magnet in [false, true] {
+                let out = dir.path().join(if magnet { "magnet" } else { "torrent" });
+                let client = new_session(&out, SessionSetup::default()).await?;
+                let result = async {
+                    let handle = if magnet {
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        let link = format!("magnet:?xt=urn:btmh:1220{}", hash.as_string());
+                        let pending = client.add_torrent(
+                            AddTorrent::from_url(link),
+                            Some(AddTorrentOptions {
+                                output_folder: Some(out.to_str().context("utf-8 path")?.to_owned()),
+                                disable_trackers: true,
+                                magnet_peers: Some(rx),
+                                ..Default::default()
+                            }),
+                        );
+                        tokio::pin!(pending);
+                        tokio::select! {
+                            result = &mut pending => {
+                                result?;
+                                anyhow::bail!("resolved without a manual peer");
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                        }
+                        tx.send(addr).await?;
+                        timeout(Duration::from_secs(20), pending)
+                            .await??
+                            .into_handle()
+                            .context("resolved magnet handle")?
+                    } else {
+                        let handle = add(&client, torrent.clone(), &out, vec![]).await?;
+                        handle.wait_until_initialized().await?;
+                        assert!(client.add_manual_peer(&handle, addr)?);
+                        assert!(!client.add_manual_peer(&handle, addr)?);
+                        handle
+                    };
+                    completed(&handle, Duration::from_secs(20)).await?;
+                    files.assert_equal_to(&out);
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                client.stop().await;
+                result?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        seeder.stop().await;
+        result
+    })
+    .await
+}
+
 /// A v2-only torrent: a seeder verifies its files with merkle hashes, a client
 /// downloads them, seeds them on to a third session, and comes back complete
 /// from its fastresume state after a restart, with no peer to download from.
