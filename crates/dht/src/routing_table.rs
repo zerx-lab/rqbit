@@ -224,10 +224,22 @@ impl BucketTree {
         id: &Id20,
         refresh: Option<Instant>,
     ) -> Option<&mut RoutingTableNode> {
+        self.find_mut(id, None, refresh)
+    }
+
+    fn find_mut(
+        &mut self,
+        id: &Id20,
+        addr: Option<SocketAddr>,
+        refresh: Option<Instant>,
+    ) -> Option<&mut RoutingTableNode> {
         let idx = self.get_leaf(id);
         match &mut self.data[idx].data {
             BucketTreeNodeData::Leaf(leaf) => {
-                let r = leaf.nodes.iter_mut().find(|b| b.id == *id);
+                let r = leaf
+                    .nodes
+                    .iter_mut()
+                    .find(|b| b.id == *id && addr.is_none_or(|addr| b.addr == addr));
                 if r.is_some()
                     && let Some(refresh) = refresh
                 {
@@ -572,6 +584,14 @@ impl RoutingTable {
         true
     }
 
+    pub(crate) fn record_bootstrap_response(&mut self, id: Id20, addr: SocketAddr, now: Instant) {
+        if !matches!(self.add_node(id, addr), InsertResult::Ignored)
+            && let Some(node) = self.buckets.find_mut(&id, Some(addr), Some(now))
+        {
+            node.mark_response(now);
+        }
+    }
+
     pub fn mark_error(&mut self, id: &Id20) -> bool {
         let r = match self.buckets.get_mut(id, None) {
             Some(r) => r,
@@ -758,5 +778,32 @@ mod tests {
         // What we knew about a node comes along with it.
         let known = new.iter().find(|n| n.id() == closest[0]).unwrap();
         assert!(matches!(known.status(now), super::NodeStatus::Good));
+    }
+
+    #[test]
+    fn bootstrap_response_only_refreshes_the_responding_endpoint() {
+        let mut table = RoutingTable::new(Id20::new([1; 20]), None);
+        let id = Id20::new([2; 20]);
+        let old = SocketAddr::from((Ipv4Addr::LOCALHOST, 8000));
+        let new = SocketAddr::from((Ipv4Addr::LOCALHOST, 8001));
+        let now = Instant::now();
+        assert!(matches!(
+            table.add_node(id, old),
+            super::InsertResult::Added
+        ));
+        assert!(table.mark_outgoing_request(&id, now));
+        assert!(table.mark_error(&id));
+        assert!(table.mark_error(&id));
+
+        table.record_bootstrap_response(id, new, now);
+        let node = table.iter().next().unwrap();
+        assert_eq!(node.addr(), old);
+        assert!(matches!(node.status(now), super::NodeStatus::Bad));
+
+        table.record_bootstrap_response(id, old, now);
+        assert!(matches!(
+            table.iter().next().unwrap().status(now),
+            super::NodeStatus::Good
+        ));
     }
 }

@@ -733,6 +733,20 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                 return Err(e);
             }
         };
+        // Bootstrap addresses are queried before their IDs are known. Keep the
+        // responder even when its find_node reply contains no usable neighbors.
+        if id.is_none() && matches!(self.request, Request::FindNode(_)) {
+            let ids = *self.dht.ids.read();
+            if response.id != ids.v4
+                && response.id != ids.v6
+                && self.dht.node_id_acceptable(&response.id, addr)
+            {
+                self.dht
+                    .get_table_for_addr(addr)
+                    .write()
+                    .record_bootstrap_response(response.id, addr, now());
+            }
+        }
 
         if let Some(peers) = response.values {
             for peer in peers {

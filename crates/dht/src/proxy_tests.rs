@@ -241,3 +241,52 @@ async fn bootstrap_host_names_follow_the_proxy_dns_mode() {
         "asked from {from}, relays {relays:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_bootstrap_keeps_late_responder_without_neighbors() {
+    let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = silent.local_addr().unwrap();
+    let client = direct_node(addr).await;
+    let hash = Id20::new([7; 20]);
+    let mut peers = client.get_peers(hash, None);
+    let mut buf = [0; 2048];
+    // Observe the initial unanswered query and an automatic retry.
+    for _ in 0..2 {
+        tokio::time::timeout(WAIT, silent.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(client.stats().routing_table_size, 0);
+    let sink = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    drop(silent);
+    let node = DhtState::with_config(DhtConfig {
+        listen_addr: Some(addr),
+        peer_id: Some(hash),
+        bootstrap_addrs: Some(vec![sink.local_addr().unwrap().to_string()]),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(node.stats().routing_table_size, 0);
+    eventually("late bootstrap responder in routing table", || async {
+        (client.stats().routing_table_size == 1).then_some(())
+    })
+    .await;
+
+    let publisher = direct_node(sink.local_addr().unwrap()).await;
+    assert_eq!(publisher.add_node(addr).await.unwrap(), hash);
+    let peer = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let announce = publisher.get_peers(hash, Some(peer_addr.port()));
+    assert_eq!(
+        tokio::time::timeout(WAIT, peers.next()).await.unwrap(),
+        Some(peer_addr)
+    );
+    drop(announce);
+    for dht in [&publisher, &node, &client] {
+        dht.cancellation_token().cancel();
+    }
+}
